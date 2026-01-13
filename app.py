@@ -80,7 +80,7 @@ def get_ai_reply(query, history, kb_text, model_choice):
         if msg['role'] == 'user': history_str += f"User: {msg['content']}\n"
         elif msg['role'] == 'assistant': history_str += f"AI: {msg.get('short', '')}\n"
 
-    # 系统指令：加入时间管理逻辑
+    # 系统指令：逻辑隔离 & URL 生成
     system_prompt = f"""
     Role: Senior Travel Planner & Consultant at Ctrip.
     
@@ -90,16 +90,22 @@ def get_ai_reply(query, history, kb_text, model_choice):
     [KNOWLEDGE BASE]:
     {kb_text}
 
-    [ROLE DEFINITION]:
-    You are not just a chatbot, you are a **Expert Trip Planner**.
-    1. **Structure**: When suggesting a Charter/Day Tour, ALWAYS provide a structured **Timeline** (e.g., 09:00 Pickup -> 10:30 Spot A...).
-    2. **Optimization**: Ensure the route is logical (no backtracking).
-    3. **Pacing**: Allocate realistic playtime (e.g., Temples ~1.5h, Theme Parks ~4h).
+    [LOGIC BRANCHING - CRITICAL]:
+    1. **IF User asks about MULTI-DAY TOURS (>4 days)**:
+       - **Focus**: Search ONLY in Multi-day package docs.
+       - **ISOLATION**: DO NOT reference or query the standalone "Hotel Rates" or "Charter" tables. Ignore them.
+       - **ACTION**: You MUST extract the **Product ID** (e.g., 66316588) and generate a URL in Reply B.
+       - **URL Format**: `https://vacations.ctrip.com/travel/detail/{{ID}}`
     
-    [PRICING RULES]:
-    1. **Charter**: Base Car Price + **1000 RMB Guide Fee**. (Include 10h/300km).
-    2. **Hotel**: Quote JPY. Disclaimer: "Secondary confirmation required".
-    3. **Inclusions**: Mentioned spots = Included tickets. Lunch mentioned = Included.
+    2. **IF User asks about DAY TOURS (<=3 days)**:
+       - Focus: Search Day Tour tables.
+       - Logic: Atomic products. Don't mix stops.
+       - Inclusions: Mentioned spots = Included tickets. Lunch = Included.
+
+    3. **IF User asks about CUSTOMIZATION / CHARTER**:
+       - Focus: Charter pricing rules.
+       - Formula: Base Price + **1000 RMB Guide Fee**.
+       - Requirement: Provide Timeline (09:00 -> 10:00...).
 
     [USER QUERY]: "{query}"
 
@@ -110,14 +116,18 @@ def get_ai_reply(query, history, kb_text, model_choice):
     
     <<<REPLY_B>>>
     (Professional Plan:
-     - **Itinerary Timeline**: 09:00... 10:00... (Detailed schedule)
-     - **Cost Breakdown**: Car + Guide.
-     - **Why this plan**: "I arranged X first to avoid crowds..."
+     - **Product Details**: ...
+     - **Cost Breakdown**: ...
+     - **LINK** (For Multi-day): 🔗 [点击查看实时库存 & 价格](https://vacations.ctrip.com/travel/detail/{{ID}})
     )
     <<<END_B>>>
 
     <<<THOUGHTS>>>
-    (中文诊断: 1.意图 2.数据来源 3.时间规划逻辑 4.价格计算)
+    (中文诊断: 
+     1. 意图识别 (多日/一日/包车)?
+     2. 是否屏蔽了酒店库? (如果是多日游)
+     3. 是否提取到了产品ID并生成了链接?
+     4. 价格/行程逻辑?)
     <<<END_THOUGHTS>>>
     """
     try: return model.generate_content(system_prompt).text
@@ -125,9 +135,7 @@ def get_ai_reply(query, history, kb_text, model_choice):
 
 # --- B. 专属行程生成 AI (用于 Tab 2) ---
 def generate_itinerary_text(start, end, optimized_stops, dist, dur, price, model_choice):
-    """
-    专门用于 Tab 2：根据地图算出的硬数据，生成一份有血有肉的行程表
-    """
+    """专门用于 Tab 2：生成分钟级行程表"""
     if not AI_KEY: return "API Key Missing"
     model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
     model = genai.GenerativeModel(model_id)
@@ -177,20 +185,15 @@ def calc_map_route(start, end, stops):
         if not res: return {"valid": False, "msg": "无路线"}
         
         route = res[0]
-        
-        # 1. 提取优化后的顺序
-        # waypoint_order 是一个索引列表，例如 [2, 0, 1] 表示原stops里的第2个点先去，然后第0个...
+        # 提取优化后的顺序
         order_indices = route.get('waypoint_order', list(range(len(stops))))
         optimized_stops = [stops[i] for i in order_indices]
         
-        # 2. 计算总数据
         dist = round(sum(l['distance']['value'] for l in route['legs'])/1000, 1)
         dur = round(sum(l['duration']['value'] for l in route['legs'])/3600, 1)
         
-        # 3. 静态地图
         poly = route['overview_polyline']['points']
         markers = [{'color':'green','label':'S','locations':[start]},{'color':'red','label':'E','locations':[end]}]
-        # 注意：地图上的点也应该按顺序或者是原始点，static map会自动规划路径显示
         if stops: markers.append({'color':'blue','label':'P','locations':stops})
         
         img_raw = gmaps.static_map(size=(800,400), path=f"enc:{poly}", markers=markers, format="png")
@@ -200,7 +203,7 @@ def calc_map_route(start, end, stops):
             "dist": dist, 
             "dur": dur, 
             "img": io.BytesIO(b"".join(img_raw)),
-            "optimized_stops": optimized_stops # 返回给AI用
+            "optimized_stops": optimized_stops 
         }
     except Exception as e: return {"valid": False, "msg": str(e)}
 
@@ -230,7 +233,7 @@ def main():
         st.divider()
         model_choice = st.radio("AI 模型", ["Gemini 3 Flash", "Gemini 3 Pro"])
 
-    st.title(" Ctrip 服务专家 Co-Pilot")
+    st.title("👩‍💼 Ctrip 客服 Copilot")
     tab_chat, tab_plan = st.tabs(["💬 智能问答", "🗺️ 包车规划 (资深版)"])
 
     # === TAB 1: 智能问答 ===
@@ -243,17 +246,17 @@ def main():
                 with st.chat_message("assistant"):
                     st.code(msg['short'], language=None)
                     with st.expander("🔽 查看详细行程 & 诊断"):
-                        st.code(msg['long'], language=None)
+                        st.markdown(msg['long']) # 注意：这里改用 markdown 渲染，因为里面可能有链接
                         st.info(msg['thoughts'])
 
         # 输入
-        user_input = st.chat_input("输入需求... (例: 大阪到京都包车，想去清水寺和奈良公园)")
+        user_input = st.chat_input("输入需求... (例: 有没有关西5日游？)")
         if user_input:
             st.session_state.messages.append({"role": "user", "content": user_input})
             with st.chat_message("user"): st.write(user_input)
 
             with st.chat_message("assistant"):
-                with st.spinner("AI 规划师正在安排时间表..."):
+                with st.spinner("AI 正在检索产品库..."):
                     raw_res = get_ai_reply(user_input, st.session_state.messages, st.session_state.kb.knowledge_text, model_choice)
                     # 解析
                     try: r_a = re.search(r'<<<REPLY_A>>>([\s\S]*?)<<<END_A>>>', raw_res).group(1).strip()
@@ -265,7 +268,7 @@ def main():
 
                     st.code(r_a, language=None)
                     with st.expander("🔽 查看详细行程 & 诊断", expanded=True):
-                        st.code(r_b, language=None)
+                        st.markdown(r_b) # 使用 Markdown 渲染以支持超链接
                         st.info(th)
                     
                     st.session_state.messages.append({"role": "assistant", "short": r_a, "long": r_b, "thoughts": th})
@@ -317,4 +320,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
