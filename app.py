@@ -26,7 +26,7 @@ if AI_KEY:
 st.set_page_config(page_title="Ctrip CS Copilot", page_icon="👩‍💼", layout="wide")
 
 # ==========================================
-# 2. 智能数据加载器 (CSV/Excel 全兼容)
+# 2. 智能数据加载器 (保持 v5.0 逻辑)
 # ==========================================
 class KnowledgeBase:
     def __init__(self):
@@ -38,26 +38,19 @@ class KnowledgeBase:
         self.hotel_cal = {}      
         self.tokyo_rates = {}    
         self.docs_text = ""      
-        self.load_status = [] # 记录加载日志
+        self.load_status = [] 
 
     def _read_any(self, pattern_keywords, header=0):
         """智能读取函数：自动尝试 xlsx, xls, csv"""
-        # 1. 构造搜索模式
         patterns = []
         for kw in pattern_keywords:
             patterns.append(f'*{kw}*.xlsx')
             patterns.append(f'*{kw}*.xls')
             patterns.append(f'*{kw}*.csv')
         
-        found_files = []
-        for p in patterns:
-            found_files.extend(glob.glob(p))
+        found_files = sorted(list(set([f for p in patterns for f in glob.glob(p)])))
         
-        # 去重并排序
-        found_files = sorted(list(set(found_files)))
-        
-        if not found_files:
-            return None, None
+        if not found_files: return None, None
         
         target_file = found_files[0]
         ext = os.path.splitext(target_file)[1].lower()
@@ -73,66 +66,47 @@ class KnowledgeBase:
 
     def load_all(self):
         try:
-            # --- 1. 一日游价格 ---
+            # 1. 价格
             data, ftype = self._read_any(['商品价格', 'Price'])
             if data is not None:
                 if ftype == 'excel':
-                    df = pd.read_excel(data, sheet_name=0, header=0) # 假设在第1个Sheet
+                    df = pd.read_excel(data, sheet_name=0, header=0)
                 else:
-                    df = data # csv已读取
-                
+                    df = data
                 df.columns = [str(c).strip() for c in df.columns]
                 if '产品名称' in df.columns:
                     self.prices = df.set_index('产品名称').to_dict('index')
-                    self.load_status.append(f"✅ 成功加载价格表 ({len(self.prices)}条)")
-            else:
-                self.load_status.append("⚠️ 未找到[商品价格]文件")
+                    self.load_status.append(f"✅ 价格表: {len(self.prices)}条")
 
-            # --- 2. 具体行程 (读取所有含有'日游'的文件) ---
-            # 简单粗暴：遍历目录下所有文件，排除掉价格表
+            # 2. 行程
             all_files = glob.glob('*日游*.xlsx') + glob.glob('*日游*.csv')
             for f in all_files:
                 if '商品价格' in f: continue
                 name = os.path.splitext(os.path.basename(f))[0].split(' - ')[-1].strip()
                 try:
-                    if f.endswith('.xlsx'):
-                        self.itineraries[name] = pd.read_excel(f, header=None)
-                    else:
-                        self.itineraries[name] = pd.read_csv(f, header=None)
+                    if f.endswith('.xlsx'): self.itineraries[name] = pd.read_excel(f, header=None)
+                    else: self.itineraries[name] = pd.read_csv(f, header=None)
                 except: pass
-            self.load_status.append(f"✅ 加载行程单: {len(self.itineraries)}个")
 
-            # --- 3. 包车 & 接送机 ---
+            # 3. 包车/接送机
             data, ftype = self._read_any(['包车', '接送机', 'Charter'])
-            if data is not None:
-                if ftype == 'excel':
-                    # Excel逻辑: 遍历Sheet找
-                    for sheet in data.sheet_names:
-                        if "包车" in sheet:
-                            df = pd.read_excel(data, sheet_name=sheet, header=1)
-                            df.columns = [str(c).strip() for c in df.columns]
-                            if '包车线路' in df.columns:
-                                self.charter = df.set_index('包车线路')['包车价格（人民币）'].to_dict()
-                        if "接送机" in sheet:
-                            # 动态找header
-                            df_raw = pd.read_excel(data, sheet_name=sheet, header=None)
-                            h_idx = df_raw[df_raw.eq('编号').any(axis=1)].index
-                            if not h_idx.empty:
-                                self.airport = pd.read_excel(data, sheet_name=sheet, header=h_idx[0]).to_dict('records')
-                else:
-                    # CSV逻辑 (假设是包车csv)
-                    df = data # header已经在_read_any处理，但包车可能是header=1
-                    # 这里简化处理，如果CSV格式复杂建议只用Excel
-                    pass 
-            
-            if self.charter: self.load_status.append("✅ 包车数据已加载")
-            if self.airport: self.load_status.append("✅ 接送机数据已加载")
+            if data is not None and ftype == 'excel':
+                for sheet in data.sheet_names:
+                    if "包车" in sheet:
+                        df = pd.read_excel(data, sheet_name=sheet, header=1)
+                        df.columns = [str(c).strip() for c in df.columns]
+                        if '包车线路' in df.columns:
+                            self.charter = df.set_index('包车线路')['包车价格（人民币）'].to_dict()
+                    if "接送机" in sheet:
+                        df_raw = pd.read_excel(data, sheet_name=sheet, header=None)
+                        h_idx = df_raw[df_raw.eq('编号').any(axis=1)].index
+                        if not h_idx.empty:
+                            self.airport = pd.read_excel(data, sheet_name=sheet, header=h_idx[0]).to_dict('records')
 
-            # --- 4. 酒店 (大阪 & 东京) ---
+            # 4. 酒店
             # 大阪
             data, ftype = self._read_any(['OSAKA', 'Plaza'])
             if data is not None and ftype == 'excel':
-                # Excel处理
                 rate_sheet = next((s for s in data.sheet_names if "OSAKA" in s), None)
                 cal_sheet = next((s for s in data.sheet_names if "Sheet1" in s), None)
                 if rate_sheet: self.hotel_rates = pd.read_excel(data, sheet_name=rate_sheet)
@@ -143,24 +117,18 @@ class KnowledgeBase:
                         if mask.any():
                             for d, code in zip(df.loc[mask, c], df.loc[mask, c+1]):
                                 if pd.notna(code): self.hotel_cal[str(d).strip()] = str(code).strip()
-            elif data is not None and ftype == 'csv':
-                # CSV处理 (之前的逻辑)
-                pass # 略，假设用户这次传的是Excel
-
             # 东京
             data, ftype = self._read_any(['SHINJUKU', 'Washington'])
-            if data is not None:
-                # 简化逻辑，仅支持Excel解析复杂日历
-                if ftype == 'excel':
-                    df = pd.read_excel(data, header=None)
-                    p_map = {str(c).strip(): float(re.sub(r'[^\d]','',str(p))) for c,p in zip(df.iloc[3], df.iloc[4]) if str(c).strip() in ['A','B','C','D','S']}
-                    for _, row in df.iloc[11:].iterrows():
-                        if '月' in str(row[0]) and str(row[3]).strip() in p_map:
-                            m = int(re.search(r'(\d+)', str(row[0])).group(1))
-                            y = 2025 if m >= 10 else 2026
-                            self.tokyo_rates[f"{y}-{m:02d}-{int(row[1]):02d}"] = p_map[str(row[3]).strip()]
+            if data is not None and ftype == 'excel':
+                df = pd.read_excel(data, header=None)
+                p_map = {str(c).strip(): float(re.sub(r'[^\d]','',str(p))) for c,p in zip(df.iloc[3], df.iloc[4]) if str(c).strip() in ['A','B','C','D','S']}
+                for _, row in df.iloc[11:].iterrows():
+                    if '月' in str(row[0]) and str(row[3]).strip() in p_map:
+                        m = int(re.search(r'(\d+)', str(row[0])).group(1))
+                        y = 2025 if m >= 10 else 2026
+                        self.tokyo_rates[f"{y}-{m:02d}-{int(row[1]):02d}"] = p_map[str(row[3]).strip()]
             
-            # --- 5. Markdown ---
+            # 5. Docs
             md_files = glob.glob('*.md')
             full_text = []
             for f in md_files:
@@ -169,16 +137,14 @@ class KnowledgeBase:
                         full_text.append(f"=== 文档: {f} ===\n{file.read()}\n")
                 except: pass
             self.docs_text = "\n".join(full_text)
-            self.load_status.append(f"✅ 知识库文档: {len(md_files)}篇")
-
+            
             return True
         except Exception as e:
-            self.load_status.append(f"❌ 致命错误: {str(e)}")
-            st.error(f"System Error: {e}")
+            self.load_status.append(f"❌ 系统错误: {str(e)}")
             return False
 
 # ==========================================
-# 3. Agent (保持不变)
+# 3. Agent (Prompt 升级：结构化输出)
 # ==========================================
 class SmartAgent:
     def __init__(self, kb):
@@ -191,15 +157,9 @@ class SmartAgent:
             self.model_pro = genai.GenerativeModel("gemini-1.5-pro")
 
     def semantic_match_product(self, user_query):
-        # 如果价格表为空，说明加载失败，直接返回通用
         if not self.kb.prices: return "General"
-        
         product_list = list(self.kb.prices.keys())
-        prompt = f"""
-        User Input: "{user_query}"
-        Products: {product_list}
-        Return the exact product name if matched. If asking for charter, return "Charter". Else "General".
-        """
+        prompt = f"User Input: '{user_query}'\nProducts: {product_list}\nMatch exact product name, or return 'Charter' if custom, else 'General'."
         try:
             res = self.model_flash.generate_content(prompt)
             matched = res.text.strip()
@@ -211,85 +171,136 @@ class SmartAgent:
 
     def generate_response(self, query, context_data, model="flash"):
         engine = self.model_pro if model == "pro" else self.model_flash
-        prompt = f"""
+        
+        # [核心修改] 让 AI 用特定分隔符输出，方便前端提取
+        base_prompt = f"""
         Role: Ctrip Senior Consultant.
         Question: "{query}"
         Context: {context_data}
-        Docs: {self.kb.docs_text[:10000]}
+        Docs: {self.kb.docs_text[:12000]}
         
-        Output format:
-        ## Part 1: 📋 一键复制回复
-        ### 选项 A (50字内)
-        ### 选项 B (专业详细)
-        ## Part 2: 🧠 销售建议
+        Task: Generate 3 parts separated by markers.
+        
+        Format Requirement:
+        ===REPLY_A===
+        (Write the Quick Reply here: < 50 words, direct conclusion)
+        ===END_A===
+
+        ===REPLY_B===
+        (Write the Professional Reply here: Warm tone, detailed, call to action)
+        ===END_B===
+
+        ===THOUGHTS===
+        (Write your logic, calculation source, and upsell tips here)
+        ===END_THOUGHTS===
         """
-        try: return engine.generate_content(prompt).text
-        except Exception as e: return f"AI Error: {e}"
+        try:
+            return engine.generate_content(base_prompt).text
+        except Exception as e:
+            return f"AI Error: {e}"
 
 # ==========================================
-# 4. 前端
+# 4. 前端界面 (解析并显示复制按钮)
 # ==========================================
 def main():
     if 'kb' not in st.session_state:
         kb = KnowledgeBase()
-        kb.load_all() # 无论成功失败都加载
+        kb.load_all()
         st.session_state.kb = kb
         st.session_state.agent = SmartAgent(kb)
         st.session_state.loaded = True
 
     with st.sidebar:
-        st.title("⚙️ 状态监控")
-        # 实时显示加载状态，方便排查
+        st.title("⚙️ 设置")
         if 'kb' in st.session_state:
-            with st.expander("查看知识库加载详情", expanded=False):
+            with st.expander("📊 知识库状态"):
                 for log in st.session_state.kb.load_status:
                     if "❌" in log: st.error(log)
-                    elif "⚠️" in log: st.warning(log)
                     else: st.write(log)
-        
         st.divider()
         date = st.date_input("出行日期", datetime(2026, 2, 1))
         pax = st.number_input("人数", 1, 15, 2)
         model = st.radio("AI 模型", ["Gemini 3 Fast", "Gemini 3 Pro"])
 
     st.title("👩‍💼 Ctrip 客服 Copilot")
-    user_input = st.chat_input("输入问题...")
+    st.caption("🚀 新功能：话术已放入代码框，点击右上角图标即可【一键复制】")
 
-    if user_input:
+    user_input = st.chat_input("输入问题... (如: 富士山一日游含餐吗？)")
+
+    if user_input and 'kb' in st.session_state:
         agent = st.session_state.agent
         kb = st.session_state.kb
         
         with st.chat_message("user"): st.write(user_input)
         
-        with st.status("🧠 AI 处理中...", expanded=True) as status:
-            # 意图识别
+        with st.status("🧠 Ctrip AI 正在计算...", expanded=True) as status:
             intent = agent.semantic_match_product(user_input)
-            st.write(f"意图: {intent}")
+            st.write(f"🔍 意图: **{intent}**")
             
             context = ""
             if intent in kb.prices:
-                # 算价逻辑
                 info = kb.prices[intent]
                 price_col = next((c for c in info if '结算' in c), None)
                 unit = float(info.get(price_col, 350))
                 tour = unit * pax
                 
-                # 酒店简单兜底
-                h_price = 13500 
-                # (此处略去复杂的酒店判断，确保不报错)
-                
+                # 简单酒店逻辑 (防止报错)
+                city = "Osaka" if "大阪" in intent else "Tokyo"
+                h_price = 20200 if city == "Tokyo" else 13500
                 total = h_price + tour
-                context = f"Product: {intent}, Total: {total}"
+                context = f"Product: {intent}, Total Price: {total}, Pax: {pax}, Date: {date}"
             elif intent == "Charter":
-                context = "Charter request."
+                context = "User wants Charter/Custom tour."
             else:
-                context = "General query."
+                context = "General Query. Check docs."
             
-            status.update(label="完成", state="complete", expanded=False)
+            status.update(label="✅ 生成完毕", state="complete", expanded=False)
 
+        # [核心修改] 解析 AI 返回的文本，分块显示
         with st.chat_message("assistant"):
             sel_model = "flash" if "Fast" in model else "pro"
-            st.markdown(agent.generate_response(user_input, context, sel_model))
+            raw_text = agent.generate_response(user_input, context, sel_model)
+            
+            # 使用正则提取三个部分
+            part_a = re.search(r'===REPLY_A===(.*?)===END_A===', raw_text, re.DOTALL)
+            part_b = re.search(r'===REPLY_B===(.*?)===END_B===', raw_text, re.DOTALL)
+            part_thoughts = re.search(r'===THOUGHTS===(.*?)===END_THOUGHTS===', raw_text, re.DOTALL)
+            
+            # 1. 极简回复 (带复制按钮)
+            st.subheader("📋 选项 A：极简版")
+            if part_a:
+                # language=None 会显示为纯文本框，右上角带复制按钮
+                st.code(part_a.group(1).strip(), language=None)
+            else:
+                st.warning("生成格式异常，请查看原始输出")
+
+            # 2. 专业回复 (带复制按钮)
+            st.subheader("💼 选项 B：专业版")
+            if part_b:
+                st.code(part_b.group(1).strip(), language=None)
+
+            # 3. 销售建议 (折叠显示)
+            with st.expander("🧠 AI 思考与销售建议", expanded=True):
+                if part_thoughts:
+                    st.markdown(part_thoughts.group(1).strip())
+                else:
+                    st.markdown(raw_text) # 兜底显示所有内容
+
+        # 工具箱保持不变
+        if intent == "Charter" or "定制" in user_input:
+            with st.expander("🧰 距离校验工具", expanded=True):
+                c1, c2 = st.columns(2)
+                start = c1.text_input("起点", "大阪")
+                end = c2.text_input("终点", "京都")
+                if st.button("🚀 校验"):
+                    if gmaps:
+                        now = datetime.now()
+                        res = gmaps.directions(start, end, mode="driving", departure_time=now)
+                        if res:
+                            d = res[0]['legs'][0]['distance']['text']
+                            t = res[0]['legs'][0]['duration']['text']
+                            st.success(f"距离: {d}, 耗时: {t}")
+                        else: st.error("未找到路线")
 
 if __name__ == "__main__":
     main()
