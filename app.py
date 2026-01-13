@@ -51,7 +51,7 @@ def get_ai_response(query, knowledge_text, model_name="flash"):
     if not AI_KEY: return "❌ 请先配置 GOOGLE_API_KEY"
     
     # 映射模型
-    model_id = "gemini-1.5-pro" if model_name == "pro" else "gemini-1.5-flash"
+    model_id = "gemini-3-pro-preview" if model_name == "pro" else "gemini-3-flash-preview"
     
     try:
         model = genai.GenerativeModel(model_id)
@@ -172,3 +172,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
