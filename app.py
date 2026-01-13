@@ -282,7 +282,7 @@ def main():
         else:
             st.error("Google Maps: 离线")
 
-    st.title("🤖 Burton 智能行程报价器")
+    st.title("🤖 Ctrip 智能行程报价器")
     
     tab1, tab2 = st.tabs(["🗺️ 行程规划", "✈️ 接送机查询"])
     
@@ -339,4 +339,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
