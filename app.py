@@ -26,7 +26,7 @@ if AI_KEY:
 st.set_page_config(page_title="Ctrip CS Copilot", page_icon="👩‍💼", layout="wide")
 
 # ==========================================
-# 2. 智能数据加载器 (保持 v5.0 逻辑)
+# 2. 智能数据加载器
 # ==========================================
 class KnowledgeBase:
     def __init__(self):
@@ -41,25 +41,18 @@ class KnowledgeBase:
         self.load_status = [] 
 
     def _read_any(self, pattern_keywords, header=0):
-        """智能读取函数：自动尝试 xlsx, xls, csv"""
         patterns = []
         for kw in pattern_keywords:
             patterns.append(f'*{kw}*.xlsx')
             patterns.append(f'*{kw}*.xls')
             patterns.append(f'*{kw}*.csv')
-        
         found_files = sorted(list(set([f for p in patterns for f in glob.glob(p)])))
-        
         if not found_files: return None, None
-        
         target_file = found_files[0]
         ext = os.path.splitext(target_file)[1].lower()
-        
         try:
-            if ext in ['.xlsx', '.xls']:
-                return pd.ExcelFile(target_file), "excel"
-            else:
-                return pd.read_csv(target_file, header=header), "csv"
+            if ext in ['.xlsx', '.xls']: return pd.ExcelFile(target_file), "excel"
+            else: return pd.read_csv(target_file, header=header), "csv"
         except Exception as e:
             self.load_status.append(f"❌ 读取失败 {target_file}: {e}")
             return None, None
@@ -69,15 +62,12 @@ class KnowledgeBase:
             # 1. 价格
             data, ftype = self._read_any(['商品价格', 'Price'])
             if data is not None:
-                if ftype == 'excel':
-                    df = pd.read_excel(data, sheet_name=0, header=0)
-                else:
-                    df = data
+                if ftype == 'excel': df = pd.read_excel(data, sheet_name=0, header=0)
+                else: df = data
                 df.columns = [str(c).strip() for c in df.columns]
                 if '产品名称' in df.columns:
                     self.prices = df.set_index('产品名称').to_dict('index')
                     self.load_status.append(f"✅ 价格表: {len(self.prices)}条")
-
             # 2. 行程
             all_files = glob.glob('*日游*.xlsx') + glob.glob('*日游*.csv')
             for f in all_files:
@@ -87,7 +77,6 @@ class KnowledgeBase:
                     if f.endswith('.xlsx'): self.itineraries[name] = pd.read_excel(f, header=None)
                     else: self.itineraries[name] = pd.read_csv(f, header=None)
                 except: pass
-
             # 3. 包车/接送机
             data, ftype = self._read_any(['包车', '接送机', 'Charter'])
             if data is not None and ftype == 'excel':
@@ -102,9 +91,7 @@ class KnowledgeBase:
                         h_idx = df_raw[df_raw.eq('编号').any(axis=1)].index
                         if not h_idx.empty:
                             self.airport = pd.read_excel(data, sheet_name=sheet, header=h_idx[0]).to_dict('records')
-
             # 4. 酒店
-            # 大阪
             data, ftype = self._read_any(['OSAKA', 'Plaza'])
             if data is not None and ftype == 'excel':
                 rate_sheet = next((s for s in data.sheet_names if "OSAKA" in s), None)
@@ -117,7 +104,6 @@ class KnowledgeBase:
                         if mask.any():
                             for d, code in zip(df.loc[mask, c], df.loc[mask, c+1]):
                                 if pd.notna(code): self.hotel_cal[str(d).strip()] = str(code).strip()
-            # 东京
             data, ftype = self._read_any(['SHINJUKU', 'Washington'])
             if data is not None and ftype == 'excel':
                 df = pd.read_excel(data, header=None)
@@ -127,7 +113,6 @@ class KnowledgeBase:
                         m = int(re.search(r'(\d+)', str(row[0])).group(1))
                         y = 2025 if m >= 10 else 2026
                         self.tokyo_rates[f"{y}-{m:02d}-{int(row[1]):02d}"] = p_map[str(row[3]).strip()]
-            
             # 5. Docs
             md_files = glob.glob('*.md')
             full_text = []
@@ -137,14 +122,13 @@ class KnowledgeBase:
                         full_text.append(f"=== 文档: {f} ===\n{file.read()}\n")
                 except: pass
             self.docs_text = "\n".join(full_text)
-            
             return True
         except Exception as e:
             self.load_status.append(f"❌ 系统错误: {str(e)}")
             return False
 
 # ==========================================
-# 3. Agent (Prompt 升级：结构化输出)
+# 3. Agent (稳健版)
 # ==========================================
 class SmartAgent:
     def __init__(self, kb):
@@ -159,7 +143,7 @@ class SmartAgent:
     def semantic_match_product(self, user_query):
         if not self.kb.prices: return "General"
         product_list = list(self.kb.prices.keys())
-        prompt = f"User Input: '{user_query}'\nProducts: {product_list}\nMatch exact product name, or return 'Charter' if custom, else 'General'."
+        prompt = f"User Input: '{user_query}'\nProducts: {product_list}\nMatch exact product name. If Charter, return 'Charter'. Else 'General'."
         try:
             res = self.model_flash.generate_content(prompt)
             matched = res.text.strip()
@@ -170,37 +154,38 @@ class SmartAgent:
         except: return "General"
 
     def generate_response(self, query, context_data, model="flash"):
+        if not AI_KEY: return "❌ 错误: 未配置 GOOGLE_API_KEY，无法生成回复。"
+        
         engine = self.model_pro if model == "pro" else self.model_flash
         
-        # [核心修改] 让 AI 用特定分隔符输出，方便前端提取
+        # 强制格式 Prompt
         base_prompt = f"""
         Role: Ctrip Senior Consultant.
         Question: "{query}"
         Context: {context_data}
         Docs: {self.kb.docs_text[:12000]}
         
-        Task: Generate 3 parts separated by markers.
+        INSTRUCTION: You MUST format your output using these exact separators:
         
-        Format Requirement:
-        ===REPLY_A===
-        (Write the Quick Reply here: < 50 words, direct conclusion)
-        ===END_A===
+        <<<REPLY_A>>>
+        (Write a Quick Reply here: < 50 words)
+        <<<END_A>>>
 
-        ===REPLY_B===
-        (Write the Professional Reply here: Warm tone, detailed, call to action)
-        ===END_B===
+        <<<REPLY_B>>>
+        (Write a Professional Reply here: Detail, Warm tone)
+        <<<END_B>>>
 
-        ===THOUGHTS===
-        (Write your logic, calculation source, and upsell tips here)
-        ===END_THOUGHTS===
+        <<<THOUGHTS>>>
+        (Write logic/internal notes here)
+        <<<END_THOUGHTS>>>
         """
         try:
             return engine.generate_content(base_prompt).text
         except Exception as e:
-            return f"AI Error: {e}"
+            return f"❌ AI 调用失败: {str(e)}"
 
 # ==========================================
-# 4. 前端界面 (解析并显示复制按钮)
+# 4. 前端界面 (带安全网)
 # ==========================================
 def main():
     if 'kb' not in st.session_state:
@@ -223,7 +208,7 @@ def main():
         model = st.radio("AI 模型", ["Gemini 3 Fast", "Gemini 3 Pro"])
 
     st.title("👩‍💼 Ctrip 客服 Copilot")
-    st.caption("🚀 新功能：话术已放入代码框，点击右上角图标即可【一键复制】")
+    st.caption("🚀 提示：如果生成失败，请检查右侧 '知识库状态' 是否正常")
 
     user_input = st.chat_input("输入问题... (如: 富士山一日游含餐吗？)")
 
@@ -243,8 +228,6 @@ def main():
                 price_col = next((c for c in info if '结算' in c), None)
                 unit = float(info.get(price_col, 350))
                 tour = unit * pax
-                
-                # 简单酒店逻辑 (防止报错)
                 city = "Osaka" if "大阪" in intent else "Tokyo"
                 h_price = 20200 if city == "Tokyo" else 13500
                 total = h_price + tour
@@ -256,37 +239,37 @@ def main():
             
             status.update(label="✅ 生成完毕", state="complete", expanded=False)
 
-        # [核心修改] 解析 AI 返回的文本，分块显示
         with st.chat_message("assistant"):
             sel_model = "flash" if "Fast" in model else "pro"
             raw_text = agent.generate_response(user_input, context, sel_model)
             
-            # 使用正则提取三个部分
-            part_a = re.search(r'===REPLY_A===(.*?)===END_A===', raw_text, re.DOTALL)
-            part_b = re.search(r'===REPLY_B===(.*?)===END_B===', raw_text, re.DOTALL)
-            part_thoughts = re.search(r'===THOUGHTS===(.*?)===END_THOUGHTS===', raw_text, re.DOTALL)
-            
-            # 1. 极简回复 (带复制按钮)
-            st.subheader("📋 选项 A：极简版")
-            if part_a:
-                # language=None 会显示为纯文本框，右上角带复制按钮
-                st.code(part_a.group(1).strip(), language=None)
+            # --- 核心修复：更强壮的解析逻辑 ---
+            # 1. 检查是否报错
+            if "❌" in raw_text:
+                st.error(raw_text)
             else:
-                st.warning("生成格式异常，请查看原始输出")
+                # 2. 尝试正则提取 (注意 Prompt 改成了 <<< >>>)
+                part_a = re.search(r'<<<REPLY_A>>>(.*?)<<<END_A>>>', raw_text, re.DOTALL)
+                part_b = re.search(r'<<<REPLY_B>>>(.*?)<<<END_B>>>', raw_text, re.DOTALL)
+                part_thoughts = re.search(r'<<<THOUGHTS>>>(.*?)<<<END_THOUGHTS>>>', raw_text, re.DOTALL)
+                
+                # 3. 成功提取 -> 显示分栏
+                if part_a and part_b:
+                    st.subheader("📋 选项 A：极简版")
+                    st.code(part_a.group(1).strip(), language=None) # 复制按钮在此
 
-            # 2. 专业回复 (带复制按钮)
-            st.subheader("💼 选项 B：专业版")
-            if part_b:
-                st.code(part_b.group(1).strip(), language=None)
+                    st.subheader("💼 选项 B：专业版")
+                    st.code(part_b.group(1).strip(), language=None) # 复制按钮在此
 
-            # 3. 销售建议 (折叠显示)
-            with st.expander("🧠 AI 思考与销售建议", expanded=True):
-                if part_thoughts:
-                    st.markdown(part_thoughts.group(1).strip())
+                    with st.expander("🧠 AI 思考与销售建议"):
+                        if part_thoughts: st.markdown(part_thoughts.group(1).strip())
+                        else: st.write("无建议")
+                
+                # 4. [安全网] 提取失败 -> 显示全量内容 (保底方案)
                 else:
-                    st.markdown(raw_text) # 兜底显示所有内容
+                    st.warning("⚠️ AI 未按标准格式输出，已切换到全量复制模式：")
+                    st.code(raw_text, language=None) # 确保有复制按钮
 
-        # 工具箱保持不变
         if intent == "Charter" or "定制" in user_input:
             with st.expander("🧰 距离校验工具", expanded=True):
                 c1, c2 = st.columns(2)
