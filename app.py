@@ -233,7 +233,7 @@ def main():
         st.divider()
         model_choice = st.radio("AI 模型", ["Gemini 3 Flash", "Gemini 3 Pro"])
 
-    st.title("👩‍💼 Ctrip 客服 Copilot")
+    st.title("Ctrip 服务专家 Co-Pilot")
     tab_chat, tab_plan = st.tabs(["💬 智能问答", "🗺️ 包车规划 (资深版)"])
 
     # === TAB 1: 智能问答 ===
@@ -320,4 +320,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
