@@ -112,7 +112,7 @@ def main():
                 st.write(f"- {f}")
         
         st.divider()
-        model_choice = st.radio("AI 模型", ["Gemini 1.5 Fast (Flash)", "Gemini 1.5 Smart (Pro)"])
+        model_choice = st.radio("AI 模型", ["gemini-3-flash-preview", "gemini-3-pro-preview"])
         model_key = "flash" if "Fast" in model_choice else "pro"
         
         if st.button("🔄 刷新知识库"):
@@ -172,4 +172,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
