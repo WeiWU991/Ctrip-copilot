@@ -26,21 +26,23 @@ if AI_KEY:
 st.set_page_config(page_title="Ctrip CS Copilot", page_icon="👩‍💼", layout="wide")
 
 # ==========================================
-# 2. 智能数据加载器
+# 2. 知识库加载器 (全兼容)
 # ==========================================
 class KnowledgeBase:
     def __init__(self):
-        self.prices = {}         
-        self.itineraries = {}    
-        self.charter = {}        
-        self.airport = []        
-        self.hotel_rates = {}    
-        self.hotel_cal = {}      
-        self.tokyo_rates = {}    
-        self.docs_text = ""      
+        self.prices = {}         # 一日游价格
+        self.itineraries = {}    # 一日游行程
+        self.charter = {}        # 包车
+        self.airport = []        # 接送机
+        self.hotel_rates = {}    # 酒店价格
+        self.hotel_cal = {}      # 酒店日历
+        self.tokyo_rates = {}    # 东京酒店
+        self.docs_text = ""      # 通用文档
+        self.multiday_text = ""  # [新增] 专门存储多日游产品信息
         self.load_status = [] 
 
     def _read_any(self, pattern_keywords, header=0):
+        """智能读取函数"""
         patterns = []
         for kw in pattern_keywords:
             patterns.append(f'*{kw}*.xlsx')
@@ -59,7 +61,7 @@ class KnowledgeBase:
 
     def load_all(self):
         try:
-            # 1. 价格
+            # 1. 价格表
             data, ftype = self._read_any(['商品价格', 'Price'])
             if data is not None:
                 if ftype == 'excel': df = pd.read_excel(data, sheet_name=0, header=0)
@@ -67,8 +69,9 @@ class KnowledgeBase:
                 df.columns = [str(c).strip() for c in df.columns]
                 if '产品名称' in df.columns:
                     self.prices = df.set_index('产品名称').to_dict('index')
-                    self.load_status.append(f"✅ 价格表: {len(self.prices)}条")
-            # 2. 行程
+                    self.load_status.append(f"✅ 一日游价格表: {len(self.prices)}条")
+
+            # 2. 一日游行程
             all_files = glob.glob('*日游*.xlsx') + glob.glob('*日游*.csv')
             for f in all_files:
                 if '商品价格' in f: continue
@@ -77,6 +80,7 @@ class KnowledgeBase:
                     if f.endswith('.xlsx'): self.itineraries[name] = pd.read_excel(f, header=None)
                     else: self.itineraries[name] = pd.read_csv(f, header=None)
                 except: pass
+
             # 3. 包车/接送机
             data, ftype = self._read_any(['包车', '接送机', 'Charter'])
             if data is not None and ftype == 'excel':
@@ -91,7 +95,8 @@ class KnowledgeBase:
                         h_idx = df_raw[df_raw.eq('编号').any(axis=1)].index
                         if not h_idx.empty:
                             self.airport = pd.read_excel(data, sheet_name=sheet, header=h_idx[0]).to_dict('records')
-            # 4. 酒店
+
+            # 4. 酒店 (大阪/东京)
             data, ftype = self._read_any(['OSAKA', 'Plaza'])
             if data is not None and ftype == 'excel':
                 rate_sheet = next((s for s in data.sheet_names if "OSAKA" in s), None)
@@ -113,22 +118,29 @@ class KnowledgeBase:
                         m = int(re.search(r'(\d+)', str(row[0])).group(1))
                         y = 2025 if m >= 10 else 2026
                         self.tokyo_rates[f"{y}-{m:02d}-{int(row[1]):02d}"] = p_map[str(row[3]).strip()]
-            # 5. Docs
+            
+            # 5. Markdown 文档 (区分多日游和通用)
             md_files = glob.glob('*.md')
             full_text = []
             for f in md_files:
                 try:
                     with open(f, 'r', encoding='utf-8') as file:
-                        full_text.append(f"=== 文档: {f} ===\n{file.read()}\n")
+                        content = file.read()
+                        if "多日游" in f:
+                            self.multiday_text += f"=== 多日游产品库 ({f}) ===\n{content}\n"
+                            self.load_status.append(f"✅ 加载多日游产品库: {f}")
+                        else:
+                            full_text.append(f"=== 通用文档 ({f}) ===\n{content}\n")
                 except: pass
             self.docs_text = "\n".join(full_text)
+            
             return True
         except Exception as e:
             self.load_status.append(f"❌ 系统错误: {str(e)}")
             return False
 
 # ==========================================
-# 3. Agent (稳健版)
+# 3. Agent (核心业务逻辑升级)
 # ==========================================
 class SmartAgent:
     def __init__(self, kb):
@@ -141,51 +153,93 @@ class SmartAgent:
             self.model_pro = genai.GenerativeModel("gemini-1.5-pro")
 
     def semantic_match_product(self, user_query):
-        if not self.kb.prices: return "General"
-        product_list = list(self.kb.prices.keys())
-        prompt = f"User Input: '{user_query}'\nProducts: {product_list}\nMatch exact product name. If Charter, return 'Charter'. Else 'General'."
+        """三层漏斗匹配: 多日游 -> 一日游 -> 包车 -> 通用"""
+        day_products = list(self.kb.prices.keys())
+        
+        prompt = f"""
+        User Query: "{user_query}"
+        Day Tour Products: {day_products}
+        
+        Task: Classify intent into ONE of these categories:
+        1. "MultiDay": User is asking about a package tour (e.g., 5 days, 7 days, Osaka+Tokyo package) OR asking about flight/visa inclusion for a package.
+        2. "DayTour": User is asking about a specific single-day trip (e.g., Fuji, Nara, Kyoto day trip). Return format: "DayTour: [Exact Name]".
+        3. "Charter": User wants to customize itinerary, change route, or rent a car.
+        4. "General": General questions (weather, visa policy alone).
+        
+        Note: If user asks about flight/visa in context of a tour, prioritize "MultiDay" check first.
+        """
         try:
             res = self.model_flash.generate_content(prompt)
             matched = res.text.strip()
-            for p in product_list:
-                if p in matched: return p
-            if "Charter" in matched or "包车" in matched: return "Charter"
+            if "MultiDay" in matched: return "MultiDay"
+            if "DayTour" in matched: 
+                # Extract specific product name
+                for p in day_products:
+                    if p in matched: return f"DayTour:{p}"
+                return "DayTour:Unknown"
+            if "Charter" in matched: return "Charter"
             return "General"
         except: return "General"
 
-    def generate_response(self, query, context_data, model="flash"):
-        if not AI_KEY: return "❌ 错误: 未配置 GOOGLE_API_KEY，无法生成回复。"
-        
+    def generate_response(self, query, intent_type, context_data, model="flash"):
+        if not AI_KEY: return "❌ 错误: 未配置 API Key"
         engine = self.model_pro if model == "pro" else self.model_flash
         
-        # 强制格式 Prompt
+        # 业务规则提示词 (Business Logic)
+        business_rules = """
+        [CRITICAL BUSINESS RULES]
+        1. **Scope Check**: If the user asks about a product NOT in the provided context/docs, output: "请联系对应产品经理了解". Do not hallucinate.
+        2. **Multi-day Tours**:
+           - ALWAYS recommend the "Starting Price" (起价).
+           - MANDATORY Disclaimer: "价格仅供参考，最终库存和售价请点击链接二次确认" (Stock/Price needs manual check).
+           - Flights/Visa: Unless docs say "Included", assume NOT included.
+        3. **Day Tours**:
+           - Calculate total price based on provided data.
+           - MANDATORY Disclaimer: "价格已确认，但余位需后台二次确认" (Price confirmed, Seat check required).
+        4. **Hotel**:
+           - MANDATORY Disclaimer: "房态实时变动，请以此价格为准，但需二次确认是否有房".
+        5. **Charter**:
+           - Provide estimated price range.
+           - Recommendation: If Day Tour route is modified, suggest Charter.
+        """
+
         base_prompt = f"""
-        Role: Ctrip Senior Consultant.
+        Role: Ctrip Senior Sales Consultant.
         Question: "{query}"
-        Context: {context_data}
-        Docs: {self.kb.docs_text[:12000]}
+        Intent: {intent_type}
         
-        INSTRUCTION: You MUST format your output using these exact separators:
+        Context Data (Price/Route):
+        {context_data}
+        
+        Knowledge Base (Multi-day Products):
+        {self.kb.multiday_text}
+        
+        Knowledge Base (General Docs):
+        {self.kb.docs_text[:10000]}
+        
+        {business_rules}
+        
+        OUTPUT FORMAT (Strictly use these separators):
         
         <<<REPLY_A>>>
-        (Write a Quick Reply here: < 50 words)
+        (Quick Reply: < 60 words. Direct Answer + Link/Price + Mandatory Disclaimer)
         <<<END_A>>>
 
         <<<REPLY_B>>>
-        (Write a Professional Reply here: Detail, Warm tone)
+        (Pro Reply: Warm greeting -> Answer -> Product Recommendation (ID) -> Upsell -> Mandatory Disclaimer)
         <<<END_B>>>
 
         <<<THOUGHTS>>>
-        (Write logic/internal notes here)
+        (Logic: Which file did you read? Why did you recommend this? Calculation steps?)
         <<<END_THOUGHTS>>>
         """
         try:
             return engine.generate_content(base_prompt).text
         except Exception as e:
-            return f"❌ AI 调用失败: {str(e)}"
+            return f"❌ AI Error: {str(e)}"
 
 # ==========================================
-# 4. 前端界面 (带安全网)
+# 4. 前端界面 (复制功能增强版)
 # ==========================================
 def main():
     if 'kb' not in st.session_state:
@@ -208,9 +262,9 @@ def main():
         model = st.radio("AI 模型", ["Gemini 3 Fast", "Gemini 3 Pro"])
 
     st.title("👩‍💼 Ctrip 客服 Copilot")
-    st.caption("🚀 提示：如果生成失败，请检查右侧 '知识库状态' 是否正常")
+    st.caption("✅ 业务规则已加载：多日游(起价+查库存) | 一日游(算价+查余位) | 兜底(找PM)")
 
-    user_input = st.chat_input("输入问题... (如: 富士山一日游含餐吗？)")
+    user_input = st.chat_input("输入问题... (如: 有没有关西5日游？包含机票吗？)")
 
     if user_input and 'kb' in st.session_state:
         agent = st.session_state.agent
@@ -218,72 +272,67 @@ def main():
         
         with st.chat_message("user"): st.write(user_input)
         
-        with st.status("🧠 Ctrip AI 正在计算...", expanded=True) as status:
-            intent = agent.semantic_match_product(user_input)
-            st.write(f"🔍 意图: **{intent}**")
+        with st.status("🧠 正在分析意图与库存...", expanded=True) as status:
+            # 1. 意图识别
+            raw_intent = agent.semantic_match_product(user_input)
+            st.write(f"🔍 意图分类: **{raw_intent}**")
             
             context = ""
-            if intent in kb.prices:
-                info = kb.prices[intent]
-                price_col = next((c for c in info if '结算' in c), None)
-                unit = float(info.get(price_col, 350))
-                tour = unit * pax
-                city = "Osaka" if "大阪" in intent else "Tokyo"
-                h_price = 20200 if city == "Tokyo" else 13500
-                total = h_price + tour
-                context = f"Product: {intent}, Total Price: {total}, Pax: {pax}, Date: {date}"
-            elif intent == "Charter":
-                context = "User wants Charter/Custom tour."
-            else:
-                context = "General Query. Check docs."
             
-            status.update(label="✅ 生成完毕", state="complete", expanded=False)
+            # --- 场景 A: 一日游 (DayTour) ---
+            if "DayTour:" in raw_intent:
+                product_name = raw_intent.split(":")[1]
+                if product_name in kb.prices:
+                    info = kb.prices[product_name]
+                    # 价格计算
+                    price_col = next((c for c in info if '结算' in c), None)
+                    unit = float(info.get(price_col, 350))
+                    tour_fee = unit * pax
+                    # 酒店兜底
+                    h_price = 13500 # 仅作参考
+                    total = h_price + tour_fee
+                    
+                    context = f"""
+                    [Day Tour Match]
+                    - Product: {product_name}
+                    - Unit Price: {unit}
+                    - Pax: {pax}
+                    - Calculated Tour Fee: {tour_fee}
+                    - Rule: Price Confirmed, Seat Availability Needs Check.
+                    """
+                else:
+                    context = "Product recognized but details missing. Check docs."
+
+            # --- 场景 B: 多日游 (MultiDay) ---
+            elif raw_intent == "MultiDay":
+                context = """
+                [Multi-day Intent]
+                - Search 'multiday_text' for matching packages (5-day, 7-day, etc).
+                - Rule: Quote 'Starting Price' found in text.
+                - Rule: MUST link to online product.
+                - Rule: Disclaimer 'Final price/stock needs manual check'.
+                - Rule: Visa/Flight usually NOT included unless specified.
+                """
+                
+            # --- 场景 C: 包车 (Charter) ---
+            elif raw_intent == "Charter":
+                context = """
+                [Charter Intent]
+                - User wants custom route.
+                - Base Price: ~2500 RMB.
+                - Suggest Charter if Day Tour doesn't fit needs.
+                """
+            
+            # --- 场景 D: 通用/未知 ---
+            else:
+                context = "General Q&A. If answer not in docs, refer to PM."
+
+            status.update(label="✅ 分析完成", state="complete", expanded=False)
 
         with st.chat_message("assistant"):
             sel_model = "flash" if "Fast" in model else "pro"
-            raw_text = agent.generate_response(user_input, context, sel_model)
+            raw_text = agent.generate_response(user_input, raw_intent, context, sel_model)
             
-            # --- 核心修复：更强壮的解析逻辑 ---
-            # 1. 检查是否报错
-            if "❌" in raw_text:
-                st.error(raw_text)
-            else:
-                # 2. 尝试正则提取 (注意 Prompt 改成了 <<< >>>)
-                part_a = re.search(r'<<<REPLY_A>>>(.*?)<<<END_A>>>', raw_text, re.DOTALL)
-                part_b = re.search(r'<<<REPLY_B>>>(.*?)<<<END_B>>>', raw_text, re.DOTALL)
-                part_thoughts = re.search(r'<<<THOUGHTS>>>(.*?)<<<END_THOUGHTS>>>', raw_text, re.DOTALL)
-                
-                # 3. 成功提取 -> 显示分栏
-                if part_a and part_b:
-                    st.subheader("📋 选项 A：极简版")
-                    st.code(part_a.group(1).strip(), language=None) # 复制按钮在此
-
-                    st.subheader("💼 选项 B：专业版")
-                    st.code(part_b.group(1).strip(), language=None) # 复制按钮在此
-
-                    with st.expander("🧠 AI 思考与销售建议"):
-                        if part_thoughts: st.markdown(part_thoughts.group(1).strip())
-                        else: st.write("无建议")
-                
-                # 4. [安全网] 提取失败 -> 显示全量内容 (保底方案)
-                else:
-                    st.warning("⚠️ AI 未按标准格式输出，已切换到全量复制模式：")
-                    st.code(raw_text, language=None) # 确保有复制按钮
-
-        if intent == "Charter" or "定制" in user_input:
-            with st.expander("🧰 距离校验工具", expanded=True):
-                c1, c2 = st.columns(2)
-                start = c1.text_input("起点", "大阪")
-                end = c2.text_input("终点", "京都")
-                if st.button("🚀 校验"):
-                    if gmaps:
-                        now = datetime.now()
-                        res = gmaps.directions(start, end, mode="driving", departure_time=now)
-                        if res:
-                            d = res[0]['legs'][0]['distance']['text']
-                            t = res[0]['legs'][0]['duration']['text']
-                            st.success(f"距离: {d}, 耗时: {t}")
-                        else: st.error("未找到路线")
-
-if __name__ == "__main__":
-    main()
+            # --- 强壮的解析与复制功能 ---
+            part_a = re.search(r'<<<REPLY_A>>>(.*?)<<<END_A>>>', raw_text, re.DOTALL)
+            part_b = re.search(r'<<<REPLY
