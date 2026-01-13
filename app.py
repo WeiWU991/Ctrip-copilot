@@ -6,7 +6,7 @@ import googlemaps
 import google.generativeai as genai
 from datetime import datetime
 import io
-import time
+import re
 
 # ==========================================
 # 1. 基础配置
@@ -27,16 +27,16 @@ if AI_KEY:
     except: pass
 
 # ==========================================
-# 2. 知识库 (分类加载)
+# 2. 知识库加载器
 # ==========================================
 class KnowledgeBase:
     def __init__(self):
-        self.day_tour_text = ""   # 一日游数据
-        self.multi_day_text = "" # 多日游数据
+        self.day_tour_text = ""
+        self.multi_day_text = ""
         self.files_loaded = []
 
     def load_all(self):
-        # 1. 加载 Excel/CSV -> 归类为一日游/单品
+        # 1. 表格数据 -> 文本
         data_files = glob.glob('*.xlsx') + glob.glob('*.xls') + glob.glob('*.csv')
         for f in data_files:
             try:
@@ -48,7 +48,7 @@ class KnowledgeBase:
                 self.files_loaded.append(f)
             except: pass
         
-        # 2. 加载 Markdown -> 根据文件名归类
+        # 2. 文档数据 -> 文本
         md_files = glob.glob('*.md')
         for f in md_files:
             try:
@@ -57,90 +57,85 @@ class KnowledgeBase:
                 if "多日游" in f:
                     self.multi_day_text += file_content
                 else:
-                    # 通用文档（如预订须知）两边都要用
                     self.day_tour_text += file_content
                     self.multi_day_text += file_content
                 self.files_loaded.append(f)
             except: pass
 
 # ==========================================
-# 3. AI 核心 (Gemini 3 Native)
+# 3. AI 核心 (规则优化)
 # ==========================================
 def get_ai_reply(query, history, kb, model_choice):
     if not AI_KEY: return "❌ 错误：未配置 API Key"
     
-    # [核心修正] 严格使用 Gemini 3 Preview
     model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
     
     try:
         model = genai.GenerativeModel(model_id)
     except Exception as e:
-        return f"模型初始化失败 ({model_id}): {e}"
+        return f"模型初始化失败: {e}"
     
-    # 构建历史记录字符串 (最近 5 轮)
-    history_str = ""
+    # 历史记录上下文
+    history_context = ""
     for msg in history[-5:]: 
-        history_str += f"{msg['role']}: {msg['content']}\n"
+        if msg['role'] == 'user':
+            history_context += f"User: {msg['content']}\n"
+        elif msg['role'] == 'assistant':
+            history_context += f"AI: {msg.get('short', '')}\n"
 
-    # 核心系统指令 (System Prompt)
+    # --- 核心 Prompt 更新 ---
     system_prompt = f"""
-    Role: You are a Senior Travel Consultant at Ctrip (携程).
-    Goal: Convert customers by recommending products from the database accurately.
+    Role: Senior Travel Consultant at Ctrip.
+    
+    [MEMORY]:
+    {history_context}
 
-    [MEMORY / CONTEXT]
-    {history_str}
-
-    [KNOWLEDGE BASE - DAY TOURS & PRICES]
+    [KNOWLEDGE - DAY TOURS]:
     {kb.day_tour_text[:20000]}
     
-    [KNOWLEDGE BASE - MULTI-DAY PACKAGES]
+    [KNOWLEDGE - MULTI-DAY]:
     {kb.multi_day_text[:20000]}
 
-    [CRITICAL BUSINESS LOGIC - READ CAREFULLY]
-    1. **Duration Check**:
-       - If user asks for **> 4 Days**: Search ONLY in [MULTI-DAY PACKAGES].
-       - If user asks for **<= 3 Days**: Search ONLY in [DAY TOURS].
+    [CRITICAL PARSING RULES]:
+    1. **Tickets (Important)**: 
+       - If an attraction name appears in the itinerary/table, treat the ticket as **INCLUDED** by default.
+       - ONLY treat as excluded if explicitly marked "自理" (Self-pay) or "不含门票".
+    2. **Meals (Important)**:
+       - If text says "Lunch" (午餐) or "Dinner" (晚餐) -> Treat as **INCLUDED**.
+       - If text says "Lunch Self-pay" (午餐自理) -> Treat as **EXCLUDED**.
     
-    2. **Atomic Product Rule (Strict)**:
-       - Products (Routes/IDs) are FIXED. You CANNOT mix stops from Product A into Product B.
-       - You CANNOT delete stops from a fixed product.
-       - You **CAN** recommend sequence: "Day 1 take Product A, Day 2 take Product B".
-    
-    3. **Customization Trigger (The "Charter" Trap)**:
-       - If user wants to change stops, add/remove attractions, or mentions specific spots not in any route:
-       - **STOP recommending standard products.**
-       - **REPLY EXACTLY**: "您的需求涉及个性化定制，标准线路无法调整。建议您使用上方的【包车规划】功能进行定制。"
-    
-    4. **Scope Boundary**:
-       - Only answer what is in the docs. Do not make up prices.
-       - If unsure, refer to "Product Manager".
+    [LOGIC RULES]:
+    1. **Duration Split**: >4 Days -> Check Multi-Day Docs. <=3 Days -> Check Day Tour Tables.
+    2. **Atomic Product**: Do not mix/edit fixed routes.
+    3. **Customization**: If user wants to change stops, reply with "Charter Suggestion" and stop recommending standard products.
+    4. **Safety**: Verify distances if user mentions Charter.
 
     [USER QUERY]: "{query}"
 
-    [OUTPUT FORMAT]:
-    Please separate your answer into two parts:
-    
+    [OUTPUT FORMAT - STRICT]:
     <<<REPLY_A>>>
-    (Quick Reply: < 60 words. Conclusion + Price + Disclaimer)
+    (Quick Reply: Conclusion + Price + Link. < 60 words)
     <<<END_A>>>
     
     <<<REPLY_B>>>
-    (Professional Reply: 
-     - If > 4 days: Recommend Package ID.
-     - If <= 3 days: Recommend Route Name (or Sequence of Routes).
-     - If Custom: Guide to Charter Tab.
-     - Always distinguish Currency (RMB/JPY/HKD).)
+    (Professional Reply: Detailed plan, upsell, polite tone)
     <<<END_B>>>
+
+    <<<THOUGHTS>>>
+    (Diagnostic: 
+     1. Did I include tickets? (Yes, because spot name listed)
+     2. Did I include meals? (Check for '自理')
+     3. Calculation logic?)
+    <<<END_THOUGHTS>>>
     """
     
     try:
-        response = model.generate_content(system_prompt)
-        return response.text
+        return model.generate_content(system_prompt).text
     except Exception as e:
-        return f"AI 接口报错 ({model_id}): {str(e)}"
+        return f"AI Error: {str(e)}"
 
 # ==========================================
-# 4. 地图计算工具
+# 4. 地图工具
 # ==========================================
 def calc_map_route(start, end, stops):
     if not gmaps: return {"valid": False, "msg": "API未连接"}
@@ -165,7 +160,6 @@ def calc_map_route(start, end, stops):
 # 5. 前端主程序
 # ==========================================
 def main():
-    # 初始化 Session
     if 'kb' not in st.session_state:
         kb = KnowledgeBase()
         kb.load_all()
@@ -174,71 +168,76 @@ def main():
     if 'messages' not in st.session_state:
         st.session_state.messages = []
 
-    # --- 侧边栏：控制台 ---
+    # --- 侧边栏 ---
     with st.sidebar:
         st.title("⚙️ 接待控制台")
-        
-        # 1. 记忆清除功能
-        if st.button("🗑️ 接待下一位客人 (清空记录)", type="primary"):
+        if st.button("🗑️ 接待下一位客人 (清空)", type="primary"):
             st.session_state.messages = []
             st.rerun()
-            
         st.divider()
         st.write(f"📚 知识库: {len(st.session_state.kb.files_loaded)} 文件")
         
-        # [核心修正] 模型选择器
-        model_choice = st.radio("AI 模型内核", ["Gemini 3 Flash", "Gemini 3 Pro"])
-        # 显示当前使用的真实 ID 以便核对
-        current_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
-        st.caption(f"🚀 Current ID: `{current_id}`")
+        # 显示当前使用的模型
+        model_choice = st.radio("AI 模型", ["Gemini 3 Flash", "Gemini 3 Pro"])
 
     st.title("👩‍💼 Ctrip 客服 Copilot")
 
-    # --- 双 Tab 架构 ---
-    tab_chat, tab_plan = st.tabs(["💬 智能问答 (标准品)", "🗺️ 包车规划 (定制)"])
+    tab_chat, tab_plan = st.tabs(["💬 智能问答", "🗺️ 包车规划"])
 
-    # === TAB 1: 问答 ===
+    # === TAB 1: 问答 (含历史回溯) ===
     with tab_chat:
-        # 显示历史对话
         for msg in st.session_state.messages:
-            if msg["type"] != "hidden":
-                with st.chat_message(msg["role"]):
-                    if msg["type"] == "code": st.code(msg["content"], language=None)
-                    else: st.write(msg["content"])
+            if msg['role'] == 'user':
+                with st.chat_message("user"): st.write(msg['content'])
+            elif msg['role'] == 'assistant':
+                with st.chat_message("assistant"):
+                    st.code(msg['short'], language=None)
+                    with st.expander("🔽 查看详细回复 & AI 诊断过程"):
+                        st.markdown("**💼 专业话术 (Reply B):**")
+                        st.code(msg['long'], language=None)
+                        st.divider()
+                        st.markdown("**🧠 AI 诊断思考 (Diagnostics):**")
+                        st.info(msg['thoughts'])
 
-        # 输入框
-        user_input = st.chat_input("输入客人需求... (如: 想要一个5天的关西行程)")
+        user_input = st.chat_input("输入客人需求... (例: 富士山一日游含午餐吗？)")
 
         if user_input:
-            # 记录用户输入
-            st.session_state.messages.append({"role": "user", "type": "text", "content": user_input})
+            st.session_state.messages.append({"role": "user", "content": user_input})
             with st.chat_message("user"): st.write(user_input)
 
-            # 调用 AI
             with st.chat_message("assistant"):
-                with st.spinner(f"Gemini 3 ({'Pro' if 'Pro' in model_choice else 'Flash'}) 正在思考..."):
-                    # 传入历史记录
+                with st.spinner("AI 正在解析行程详情 (门票/餐食)..."):
                     raw_res = get_ai_reply(user_input, st.session_state.messages, st.session_state.kb, model_choice)
                     
-                    # 解析 A/B
                     try:
-                        reply_a = raw_res.split("<<<REPLY_A>>>")[1].split("<<<END_A>>>")[0].strip()
-                        reply_b = raw_res.split("<<<REPLY_B>>>")[1].split("<<<END_B>>>")[0].strip()
-                    except:
-                        reply_a = raw_res
-                        reply_b = None
+                        reply_a = re.search(r'<<<REPLY_A>>>([\s\S]*?)<<<END_A>>>', raw_res).group(1).strip()
+                    except: reply_a = raw_res
+                    
+                    try:
+                        reply_b = re.search(r'<<<REPLY_B>>>([\s\S]*?)<<<END_B>>>', raw_res).group(1).strip()
+                    except: reply_b = "未生成"
 
-                    st.subheader("📋 极简回复")
+                    try:
+                        thoughts = re.search(r'<<<THOUGHTS>>>([\s\S]*?)<<<END_THOUGHTS>>>', raw_res).group(1).strip()
+                    except: thoughts = "无记录"
+
                     st.code(reply_a, language=None)
-                    st.session_state.messages.append({"role": "assistant", "type": "code", "content": reply_a})
-
-                    if reply_b:
-                        st.subheader("💼 专业回复")
+                    
+                    with st.expander("🔽 查看详细回复 & AI 诊断过程", expanded=True):
+                        st.markdown("**💼 专业话术 (Reply B):**")
                         st.code(reply_b, language=None)
-                        # 专业版存入历史但隐藏显示（避免重复）
-                        st.session_state.messages.append({"role": "assistant", "type": "hidden", "content": reply_b})
+                        st.divider()
+                        st.markdown("**🧠 AI 诊断思考 (Diagnostics):**")
+                        st.info(thoughts)
 
-    # === TAB 2: 包车 ===
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "short": reply_a,
+                        "long": reply_b,
+                        "thoughts": thoughts
+                    })
+
+    # === TAB 2: 包车规划 ===
     with tab_plan:
         c1, c2 = st.columns([1, 2])
         with c1:
@@ -261,15 +260,12 @@ def main():
             if 'plan_res' in st.session_state:
                 res = st.session_state.plan_res
                 total = st.session_state.plan_price
-                
                 st.image(res['img'], caption="行程预览", use_container_width=True)
-                
                 msg = f"""【定制包车方案】
 📍 路线：{start} -> ... -> {end}
 📏 统计：{res['dist']}km | {res['dur']}小时
-💰 报价：¥{total} (含车+导，不含超时)
+💰 报价：¥{total} (含车+导)
 ⚠️ 评估：{'✅ 行程合理' if res['dist']<=300 else '⚠️ 距离过长，建议调整'}"""
-                
                 st.code(msg, language=None)
 
 if __name__ == "__main__":
