@@ -12,7 +12,7 @@ import io
 # ==========================================
 GOOGLE_MAPS_API_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
 
-st.set_page_config(page_title="Burton Travel Copilot", page_icon="✈️", layout="wide")
+st.set_page_config(page_title="Trip Travel Copilot", page_icon="✈️", layout="wide")
 
 # ==========================================
 # 2. 数据加载层 (针对新上传数据的终极适配版)
@@ -278,3 +278,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
