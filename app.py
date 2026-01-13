@@ -63,7 +63,7 @@ class KnowledgeBase:
             except: pass
 
 # ==========================================
-# 3. AI 核心 (全中文思考指令)
+# 3. AI 核心 (强制包车逻辑)
 # ==========================================
 def get_ai_reply(query, history, kb, model_choice):
     if not AI_KEY: return "❌ 错误：未配置 API Key"
@@ -84,50 +84,52 @@ def get_ai_reply(query, history, kb, model_choice):
         elif msg['role'] == 'assistant':
             history_context += f"AI: {msg.get('short', '')}\n"
 
-    # --- 核心 Prompt (中文强化版) ---
+    # --- 核心 Prompt (注入包车数学公式) ---
     system_prompt = f"""
     Role: Senior Travel Consultant at Ctrip.
     
     [MEMORY]:
     {history_context}
 
-    [KNOWLEDGE - DAY TOURS]:
+    [KNOWLEDGE - DAY TOURS & CHARTER]:
     {kb.day_tour_text[:20000]}
     
     [KNOWLEDGE - MULTI-DAY]:
     {kb.multi_day_text[:20000]}
 
-    [CRITICAL PARSING RULES]:
-    1. **Tickets (Important)**: 
-       - If an attraction name appears in the itinerary/table, treat the ticket as **INCLUDED** by default.
-       - ONLY treat as excluded if explicitly marked "自理" (Self-pay) or "不含门票".
-    2. **Meals (Important)**:
-       - If text says "Lunch" (午餐) or "Dinner" (晚餐) -> Treat as **INCLUDED**.
-       - If text says "Lunch Self-pay" (午餐自理) -> Treat as **EXCLUDED**.
+    [CRITICAL BUSINESS RULES]:
+    1. **Tickets**: Mentioned spots = Included (unless marked 'Self-pay').
+    2. **Meals**: Mentioned 'Lunch' = Included. 'Self-pay' = Excluded.
     
-    [LOGIC RULES]:
-    1. **Duration Split**: >4 Days -> Check Multi-Day Docs. <=3 Days -> Check Day Tour Tables.
-    2. **Atomic Product**: Do not mix/edit fixed routes.
-    3. **Customization**: If user wants to change stops, reply with "Charter Suggestion" and stop recommending standard products.
-    4. **Safety**: Verify distances if user mentions Charter.
+    [CHARTER PRICING FORMULA (Must Follow)]:
+    If user asks about "Charter" (包车) or "Custom" (定制) price:
+    1. **Base Price**: Find the car price in the table (e.g., '10座海狮' in '包车.xlsx').
+    2. **Guide Fee**: ALWAYS ADD fixed **1000 RMB** for the guide.
+    3. **Total Price** = Base Price + 1000 RMB.
+    4. **Service Limit**: Explicitly state "Includes 10 hours / 300 km per day".
+    5. **Driver**: Note that "Driver price is included in Base Price".
+
+    [LOGIC FLOW]:
+    1. **Duration**: >4 Days -> Check Multi-Day Docs. <=3 Days -> Check Day Tour Tables.
+    2. **Customization**: If user changes stops -> Switch to "Charter Mode" -> Use the Formula above.
+    3. **Validation**: If user mentions specific charter routes, recommend checking the "Charter Plan Tab" for distance validation.
 
     [USER QUERY]: "{query}"
 
     [OUTPUT FORMAT - STRICT]:
     <<<REPLY_A>>>
-    (Quick Reply: Conclusion + Price + Link. < 60 words)
+    (Quick Reply: Conclusion + Calculated Price (Car+Guide) + Link. < 60 words)
     <<<END_A>>>
     
     <<<REPLY_B>>>
-    (Professional Reply: Detailed plan, upsell, polite tone)
+    (Professional Reply: Breakdown (Car + Guide 1000), Service Limits (10h/300km), Upsell)
     <<<END_B>>>
 
     <<<THOUGHTS>>>
-    (请务必用中文回答诊断过程：
-     1. 意图识别：用户想问什么？(一日游/多日游/包车)
-     2. 知识引用：我查找了哪个文件？哪一行数据？
-     3. 门票/餐食判断：为什么判断含/不含？(例如：看到了“午餐自理”字样)
-     4. 计算逻辑：价格是怎么算出来的？)
+    (中文诊断:
+     1. 意图: 一日游 vs 包车?
+     2. 价格计算: 如果是包车，是否执行了 (车价 + 1000) 的公式？
+     3. 限制条款: 是否提到了 10h/300km？)
     <<<END_THOUGHTS>>>
     """
     
@@ -179,7 +181,6 @@ def main():
         st.divider()
         st.write(f"📚 知识库: {len(st.session_state.kb.files_loaded)} 文件")
         
-        # 显示当前使用的模型
         model_choice = st.radio("AI 模型", ["Gemini 3 Flash", "Gemini 3 Pro"])
 
     st.title("👩‍💼 Ctrip 客服 Copilot")
@@ -201,14 +202,14 @@ def main():
                         st.markdown("**🧠 AI 诊断思考 (Diagnostics):**")
                         st.info(msg['thoughts'])
 
-        user_input = st.chat_input("输入客人需求... (例: 富士山一日游含午餐吗？)")
+        user_input = st.chat_input("输入客人需求... (例: 大阪到京都包车多少钱？)")
 
         if user_input:
             st.session_state.messages.append({"role": "user", "content": user_input})
             with st.chat_message("user"): st.write(user_input)
 
             with st.chat_message("assistant"):
-                with st.spinner("AI 正在解析行程详情..."):
+                with st.spinner("AI 正在计算报价 (车费+导游)..."):
                     raw_res = get_ai_reply(user_input, st.session_state.messages, st.session_state.kb, model_choice)
                     
                     try:
@@ -254,7 +255,7 @@ def main():
                     res = calc_map_route(start, end, wps)
                     if res['valid']:
                         st.session_state.plan_res = res
-                        st.session_state.plan_price = price_base + 1000
+                        st.session_state.plan_price = price_base + 1000 # 保持逻辑一致
                     else:
                         st.error(res['msg'])
 
@@ -267,6 +268,7 @@ def main():
 📍 路线：{start} -> ... -> {end}
 📏 统计：{res['dist']}km | {res['dur']}小时
 💰 报价：¥{total} (含车+导)
+📝 标准：10小时/300公里
 ⚠️ 评估：{'✅ 行程合理' if res['dist']<=300 else '⚠️ 距离过长，建议调整'}"""
                 st.code(msg, language=None)
 
