@@ -63,11 +63,12 @@ class KnowledgeBase:
             except: pass
 
 # ==========================================
-# 3. AI 核心 (规则优化)
+# 3. AI 核心 (全中文思考指令)
 # ==========================================
 def get_ai_reply(query, history, kb, model_choice):
     if not AI_KEY: return "❌ 错误：未配置 API Key"
     
+    # 锁定模型 ID
     model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
     
     try:
@@ -75,7 +76,7 @@ def get_ai_reply(query, history, kb, model_choice):
     except Exception as e:
         return f"模型初始化失败: {e}"
     
-    # 历史记录上下文
+    # 历史上下文
     history_context = ""
     for msg in history[-5:]: 
         if msg['role'] == 'user':
@@ -83,7 +84,7 @@ def get_ai_reply(query, history, kb, model_choice):
         elif msg['role'] == 'assistant':
             history_context += f"AI: {msg.get('short', '')}\n"
 
-    # --- 核心 Prompt 更新 ---
+    # --- 核心 Prompt (中文强化版) ---
     system_prompt = f"""
     Role: Senior Travel Consultant at Ctrip.
     
@@ -122,10 +123,11 @@ def get_ai_reply(query, history, kb, model_choice):
     <<<END_B>>>
 
     <<<THOUGHTS>>>
-    (Diagnostic: 
-     1. Did I include tickets? (Yes, because spot name listed)
-     2. Did I include meals? (Check for '自理')
-     3. Calculation logic?)
+    (请务必用中文回答诊断过程：
+     1. 意图识别：用户想问什么？(一日游/多日游/包车)
+     2. 知识引用：我查找了哪个文件？哪一行数据？
+     3. 门票/餐食判断：为什么判断含/不含？(例如：看到了“午餐自理”字样)
+     4. 计算逻辑：价格是怎么算出来的？)
     <<<END_THOUGHTS>>>
     """
     
@@ -206,7 +208,7 @@ def main():
             with st.chat_message("user"): st.write(user_input)
 
             with st.chat_message("assistant"):
-                with st.spinner("AI 正在解析行程详情 (门票/餐食)..."):
+                with st.spinner("AI 正在解析行程详情..."):
                     raw_res = get_ai_reply(user_input, st.session_state.messages, st.session_state.kb, model_choice)
                     
                     try:
