@@ -27,48 +27,64 @@ if AI_KEY:
     except: pass
 
 # ==========================================
-# 2. 知识库加载器
+# 2. 知识库加载器 (分类+无限上下文)
 # ==========================================
 class KnowledgeBase:
     def __init__(self):
-        self.day_tour_text = ""
-        self.multi_day_text = ""
+        self.day_tour_text = ""   # 一日游
+        self.multi_day_text = "" # 多日游
+        self.hotel_text = ""     # 酒店 (新增)
         self.files_loaded = []
 
     def load_all(self):
-        # 1. 表格数据 -> 文本
+        # 1. 表格数据 (Excel/CSV)
         data_files = glob.glob('*.xlsx') + glob.glob('*.xls') + glob.glob('*.csv')
         for f in data_files:
             try:
+                # 读取并转换为 Markdown 表格
                 if f.endswith('.csv'): df = pd.read_csv(f, header=None)
                 else: df = pd.read_excel(f, header=None)
                 df = df.dropna(how='all')
-                content = f"\n\n=== 单日产品表: {os.path.basename(f)} ===\n{df.to_markdown(index=False)}"
-                self.day_tour_text += content
+                
+                # 构建内容块
+                fname = os.path.basename(f).upper()
+                content = f"\n\n=== 数据表: {fname} ===\n{df.to_markdown(index=False)}"
+                
+                # 智能归类
+                if any(k in fname for k in ["HOTEL", "OSAKA", "SHINJUKU", "酒店", "PLAZA", "WASHINGTON"]):
+                    self.hotel_text += content
+                elif "多日游" in fname:
+                    self.multi_day_text += content
+                else:
+                    self.day_tour_text += content
+                
                 self.files_loaded.append(f)
             except: pass
         
-        # 2. 文档数据 -> 文本
+        # 2. 文档数据 (Markdown)
         md_files = glob.glob('*.md')
         for f in md_files:
             try:
                 content = open(f, 'r', encoding='utf-8').read()
-                file_content = f"\n\n=== 业务文档: {os.path.basename(f)} ===\n{content}"
+                fname = os.path.basename(f)
+                file_content = f"\n\n=== 业务文档: {fname} ===\n{content}"
+                
                 if "多日游" in f:
                     self.multi_day_text += file_content
                 else:
+                    # 通用文档全覆盖
                     self.day_tour_text += file_content
                     self.multi_day_text += file_content
+                    self.hotel_text += file_content # 酒店也需要看通用规则
                 self.files_loaded.append(f)
             except: pass
 
 # ==========================================
-# 3. AI 核心 (强制包车逻辑)
+# 3. AI 核心 (Prompt 注入酒店逻辑)
 # ==========================================
 def get_ai_reply(query, history, kb, model_choice):
     if not AI_KEY: return "❌ 错误：未配置 API Key"
     
-    # 锁定模型 ID
     model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
     
     try:
@@ -84,52 +100,54 @@ def get_ai_reply(query, history, kb, model_choice):
         elif msg['role'] == 'assistant':
             history_context += f"AI: {msg.get('short', '')}\n"
 
-    # --- 核心 Prompt (注入包车数学公式) ---
+    # --- 核心 Prompt ---
+    # 注意：这里不再使用 [:20000]，而是全量喂入
     system_prompt = f"""
     Role: Senior Travel Consultant at Ctrip.
     
     [MEMORY]:
     {history_context}
 
-    [KNOWLEDGE - DAY TOURS & CHARTER]:
-    {kb.day_tour_text[:20000]}
+    [KNOWLEDGE - HOTELS & RATES]:
+    {kb.hotel_text}
+
+    [KNOWLEDGE - DAY TOURS]:
+    {kb.day_tour_text}
     
     [KNOWLEDGE - MULTI-DAY]:
-    {kb.multi_day_text[:20000]}
+    {kb.multi_day_text}
 
-    [CRITICAL BUSINESS RULES]:
-    1. **Tickets**: Mentioned spots = Included (unless marked 'Self-pay').
-    2. **Meals**: Mentioned 'Lunch' = Included. 'Self-pay' = Excluded.
-    
-    [CHARTER PRICING FORMULA (Must Follow)]:
-    If user asks about "Charter" (包车) or "Custom" (定制) price:
-    1. **Base Price**: Find the car price in the table (e.g., '10座海狮' in '包车.xlsx').
-    2. **Guide Fee**: ALWAYS ADD fixed **1000 RMB** for the guide.
-    3. **Total Price** = Base Price + 1000 RMB.
-    4. **Service Limit**: Explicitly state "Includes 10 hours / 300 km per day".
-    5. **Driver**: Note that "Driver price is included in Base Price".
-
-    [LOGIC FLOW]:
-    1. **Duration**: >4 Days -> Check Multi-Day Docs. <=3 Days -> Check Day Tour Tables.
-    2. **Customization**: If user changes stops -> Switch to "Charter Mode" -> Use the Formula above.
-    3. **Validation**: If user mentions specific charter routes, recommend checking the "Charter Plan Tab" for distance validation.
+    [CRITICAL RULES]:
+    1. **Hotel Queries**: 
+       - Check [KNOWLEDGE - HOTELS] first.
+       - If tables show "Rank A/B/C" dates, try to match the user's date to a Rank, then find the price.
+       - Quote the specific currency (JPY/RMB) exactly as in the table.
+       - Disclaimer: "房态和价格实时变动，请以二次确认为准".
+    2. **Day Tour Inclusions**: 
+       - Spots mentioned = Ticket Included (unless 'Self-pay').
+       - Lunch mentioned = Included. 'Lunch Self-pay' = Excluded.
+    3. **Charter Logic**: 
+       - Base Car Price (from table) + **1000 RMB Guide Fee**.
+       - Limit: 10 Hours / 300 KM.
+    4. **Scope**: If answer not found, say "请联系产品经理".
 
     [USER QUERY]: "{query}"
 
-    [OUTPUT FORMAT - STRICT]:
+    [OUTPUT FORMAT]:
     <<<REPLY_A>>>
-    (Quick Reply: Conclusion + Calculated Price (Car+Guide) + Link. < 60 words)
+    (Quick Reply: < 60 words)
     <<<END_A>>>
     
     <<<REPLY_B>>>
-    (Professional Reply: Breakdown (Car + Guide 1000), Service Limits (10h/300km), Upsell)
+    (Professional Reply)
     <<<END_B>>>
 
     <<<THOUGHTS>>>
     (中文诊断:
-     1. 意图: 一日游 vs 包车?
-     2. 价格计算: 如果是包车，是否执行了 (车价 + 1000) 的公式？
-     3. 限制条款: 是否提到了 10h/300km？)
+     1. 识别意图: 酒店/一日游/包车?
+     2. 数据来源: 读了哪个文件?
+     3. 酒店逻辑: 如何匹配日期和等级? (如适用)
+     4. 价格计算过程?)
     <<<END_THOUGHTS>>>
     """
     
@@ -187,7 +205,7 @@ def main():
 
     tab_chat, tab_plan = st.tabs(["💬 智能问答", "🗺️ 包车规划"])
 
-    # === TAB 1: 问答 (含历史回溯) ===
+    # === TAB 1: 问答 ===
     with tab_chat:
         for msg in st.session_state.messages:
             if msg['role'] == 'user':
@@ -202,14 +220,14 @@ def main():
                         st.markdown("**🧠 AI 诊断思考 (Diagnostics):**")
                         st.info(msg['thoughts'])
 
-        user_input = st.chat_input("输入客人需求... (例: 大阪到京都包车多少钱？)")
+        user_input = st.chat_input("输入客人需求... (例: 大阪广场酒店3月1号多少钱？)")
 
         if user_input:
             st.session_state.messages.append({"role": "user", "content": user_input})
             with st.chat_message("user"): st.write(user_input)
 
             with st.chat_message("assistant"):
-                with st.spinner("AI 正在计算报价 (车费+导游)..."):
+                with st.spinner("AI 正在查阅价格表..."):
                     raw_res = get_ai_reply(user_input, st.session_state.messages, st.session_state.kb, model_choice)
                     
                     try:
@@ -255,7 +273,7 @@ def main():
                     res = calc_map_route(start, end, wps)
                     if res['valid']:
                         st.session_state.plan_res = res
-                        st.session_state.plan_price = price_base + 1000 # 保持逻辑一致
+                        st.session_state.plan_price = price_base + 1000
                     else:
                         st.error(res['msg'])
 
@@ -268,7 +286,6 @@ def main():
 📍 路线：{start} -> ... -> {end}
 📏 统计：{res['dist']}km | {res['dur']}小时
 💰 报价：¥{total} (含车+导)
-📝 标准：10小时/300公里
 ⚠️ 评估：{'✅ 行程合理' if res['dist']<=300 else '⚠️ 距离过长，建议调整'}"""
                 st.code(msg, language=None)
 
