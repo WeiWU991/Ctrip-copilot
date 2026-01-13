@@ -7,7 +7,6 @@ from datetime import datetime
 import googlemaps
 import google.generativeai as genai
 import io
-import time
 
 # ==========================================
 # 1. 配置与初始化
@@ -27,7 +26,7 @@ if AI_KEY:
 st.set_page_config(page_title="Ctrip CS Copilot", page_icon="👩‍💼", layout="wide")
 
 # ==========================================
-# 2. 知识库加载器 (深层 Sheet 扫描)
+# 2. 知识库加载器 (智能表头定位 + 双格式兼容)
 # ==========================================
 class KnowledgeBase:
     def __init__(self):
@@ -43,10 +42,34 @@ class KnowledgeBase:
         self.load_status = [] 
         self.loaded_counts = {"DayTour": 0, "Charter": 0, "Hotel": 0, "Docs": 0}
 
+    def _smart_read_df(self, df, required_col_kw):
+        """
+        智能寻找表头：
+        扫描前10行，找到包含 required_col_kw (如'产品名称') 的那一行作为Header
+        """
+        # 1. 尝试直接检查列名
+        if any(required_col_kw in str(c) for c in df.columns):
+            return df
+        
+        # 2. 扫描前10行内容
+        for idx, row in df.head(10).iterrows():
+            # 将整行转为字符串查找关键词
+            row_str = " ".join([str(x) for x in row.values])
+            if required_col_kw in row_str:
+                # 找到了！以这一行为header重新整理数据
+                df.columns = df.iloc[idx] # 设为列名
+                df = df.iloc[idx+1:]      # 取下面的数据
+                df = df.reset_index(drop=True)
+                return df
+        
+        return None # 没找到
+
     def load_all(self):
         self.load_status = []
         try:
-            # --- 策略 A: 扫描所有 Excel 文件 (深层扫描 Sheet) ---
+            # =========================================
+            # 策略 A: 优先扫描 Excel (.xlsx / .xls)
+            # =========================================
             xlsx_files = glob.glob('*.xlsx') + glob.glob('*.xls')
             
             for f in xlsx_files:
@@ -54,68 +77,99 @@ class KnowledgeBase:
                     xls = pd.ExcelFile(f)
                     filename = os.path.basename(f)
                     
-                    # 遍历这个文件里的所有 Sheet
                     for sheet in xls.sheet_names:
                         sheet_clean = sheet.strip()
                         
-                        # 1. 发现 [商品价格] Sheet -> 载入价格表
+                        # --- 1. 一日游价格 ---
                         if "商品价格" in sheet_clean or "Price" in sheet_clean:
-                            df = pd.read_excel(xls, sheet_name=sheet, header=0)
-                            df.columns = [str(c).strip() for c in df.columns]
-                            if '产品名称' in df.columns:
-                                self.prices.update(df.set_index('产品名称').to_dict('index'))
-                                self.load_status.append(f"✅ 提取价格: {filename} -> {sheet}")
-                                self.loaded_counts["DayTour"] = len(self.prices)
+                            df = pd.read_excel(xls, sheet_name=sheet, header=None) # 先不设Header
+                            # 智能寻找包含"产品名称"的行
+                            df_smart = self._smart_read_df(df, "产品名称")
+                            
+                            if df_smart is not None:
+                                df_smart.columns = [str(c).strip() for c in df_smart.columns]
+                                self.prices.update(df_smart.set_index('产品名称').to_dict('index'))
+                                self.load_status.append(f"✅ Excel提取价格: {filename} - {sheet}")
+                            else:
+                                self.load_status.append(f"⚠️ 发现价格表但未找到'产品名称'列: {sheet}")
 
-                        # 2. 发现 [包车] Sheet -> 载入包车
+                        # --- 2. 包车 ---
                         elif "包车" in sheet_clean:
-                            df = pd.read_excel(xls, sheet_name=sheet, header=1) # 包车通常header=1
-                            df.columns = [str(c).strip() for c in df.columns]
-                            if '包车线路' in df.columns:
-                                self.charter.update(df.set_index('包车线路')['包车价格（人民币）'].to_dict())
-                                self.load_status.append(f"✅ 提取包车: {filename} -> {sheet}")
-                                self.loaded_counts["Charter"] = len(self.charter)
-
-                        # 3. 发现 [接送机] Sheet -> 载入接送机
+                            df = pd.read_excel(xls, sheet_name=sheet, header=None)
+                            df_smart = self._smart_read_df(df, "包车线路") # 找"包车线路"
+                            
+                            if df_smart is not None:
+                                df_smart.columns = [str(c).strip() for c in df_smart.columns]
+                                self.charter.update(df_smart.set_index('包车线路')['包车价格（人民币）'].to_dict())
+                                self.load_status.append(f"✅ Excel提取包车: {sheet}")
+                        
+                        # --- 3. 接送机 ---
                         elif "接送机" in sheet_clean:
-                            df_raw = pd.read_excel(xls, sheet_name=sheet, header=None)
-                            # 动态找 Header
-                            h_idx = -1
-                            for idx, row in df_raw.iterrows():
-                                if row.astype(str).str.contains("编号").any():
-                                    h_idx = idx
-                                    break
-                            if h_idx != -1:
-                                self.airport = pd.read_excel(xls, sheet_name=sheet, header=h_idx).to_dict('records')
-                                self.load_status.append(f"✅ 提取接送机: {filename} -> {sheet}")
+                            df = pd.read_excel(xls, sheet_name=sheet, header=None)
+                            df_smart = self._smart_read_df(df, "编号")
+                            if df_smart is not None:
+                                self.airport = df_smart.to_dict('records')
+                                self.load_status.append(f"✅ Excel提取接送机: {sheet}")
 
-                        # 4. 发现 [OSAKA] 价格表
+                        # --- 4. 酒店 & 行程 ---
                         elif "OSAKA" in sheet_clean and "Sheet1" not in sheet_clean:
                             self.hotel_rates = pd.read_excel(xls, sheet_name=sheet)
                             self.loaded_counts["Hotel"] += 1
                         
-                        # 5. 发现 [Sheet1] 且在 大阪文件里 -> 日历
-                        elif "Sheet1" in sheet_clean and ("OSAKA" in filename or "PLAZA" in filename.upper()):
+                        elif "Sheet1" in sheet_clean and ("OSAKA" in filename.upper() or "PLAZA" in filename.upper()):
                             df = pd.read_excel(xls, sheet_name=sheet, header=None)
                             self._parse_calendar(df)
                             self.load_status.append(f"✅ 提取大阪日历: {filename}")
 
-                        # 6. 东京酒店 (SHINJUKU)
                         elif "SHINJUKU" in filename.upper():
                             df = pd.read_excel(xls, sheet_name=sheet, header=None)
                             self._parse_shinjuku(df)
                             self.load_status.append(f"✅ 提取东京酒店: {filename}")
                             self.loaded_counts["Hotel"] += 1
 
-                        # 7. 剩下的通常是 [具体线路行程] (如果文件名包含"日游")
                         elif "日游" in filename and "商品价格" not in sheet_clean:
-                            # 排除掉价格表本身，其他的Sheet名通常就是线路名
                             self.itineraries[sheet_clean] = pd.read_excel(xls, sheet_name=sheet, header=None)
 
                 except Exception as e:
-                    self.load_status.append(f"⚠️ 无法读取 {f}: {e}")
+                    self.load_status.append(f"⚠️ Excel读取警告 {f}: {e}")
 
-            # --- 策略 B: 扫描 Markdown 文档 ---
+            # =========================================
+            # 策略 B: 补充扫描 CSV (.csv)
+            # =========================================
+            csv_files = glob.glob('*.csv')
+            for f in csv_files:
+                try:
+                    filename = os.path.basename(f)
+                    
+                    # 1. 价格表 CSV
+                    if "商品价格" in filename or "Price" in filename:
+                        df = pd.read_csv(f, header=None)
+                        df_smart = self._smart_read_df(df, "产品名称")
+                        if df_smart is not None:
+                            df_smart.columns = [str(c).strip() for c in df_smart.columns]
+                            self.prices.update(df_smart.set_index('产品名称').to_dict('index'))
+                            self.load_status.append(f"✅ CSV提取价格: {filename}")
+
+                    # 2. 包车 CSV
+                    elif "包车" in filename:
+                        df = pd.read_csv(f, header=None)
+                        df_smart = self._smart_read_df(df, "包车线路")
+                        if df_smart is not None:
+                            df_smart.columns = [str(c).strip() for c in df_smart.columns]
+                            self.charter.update(df_smart.set_index('包车线路')['包车价格（人民币）'].to_dict())
+                            self.load_status.append(f"✅ CSV提取包车: {filename}")
+                    
+                    # 3. 行程 CSV
+                    elif "日游" in filename and "商品价格" not in filename:
+                        clean_name = filename.split(' - ')[-1].replace('.csv', '').strip()
+                        self.itineraries[clean_name] = pd.read_csv(f, header=None)
+                
+                except Exception as e:
+                    self.load_status.append(f"⚠️ CSV读取警告 {f}: {e}")
+
+            # =========================================
+            # 策略 C: 文档加载
+            # =========================================
             md_files = glob.glob('*.md')
             full_text = []
             for f in md_files:
@@ -129,6 +183,10 @@ class KnowledgeBase:
                             full_text.append(f"=== 通用文档 ({f}) ===\n{content}\n")
                 except: pass
             self.docs_text = "\n".join(full_text)
+            
+            # 更新计数
+            self.loaded_counts["DayTour"] = len(self.prices)
+            self.loaded_counts["Charter"] = len(self.charter)
             self.loaded_counts["Docs"] = len(md_files)
             
             return True
@@ -154,7 +212,7 @@ class KnowledgeBase:
         except: pass
 
 # ==========================================
-# 3. Agent (销售漏斗逻辑)
+# 3. Agent
 # ==========================================
 class SmartAgent:
     def __init__(self, kb):
@@ -167,17 +225,15 @@ class SmartAgent:
             self.model_pro = genai.GenerativeModel("gemini-1.5-pro")
 
     def semantic_match_product(self, user_query):
-        """漏斗匹配: 多日游 -> 一日游 -> 包车 -> 通用"""
         day_products = list(self.kb.prices.keys())
         prompt = f"""
         User Query: "{user_query}"
-        Day Tour List: {day_products}
-        
-        Analyze Intent (Return ONE string):
-        1. "MultiDay": User asks about 5-day, 7-day packages, or general package questions (visa/flight within package).
-        2. "DayTour: [Exact Name]": User asks about specific one-day trips (Fuji, Nara, Kyoto). Match closest name.
-        3. "Charter": User wants customization, car rental, or modifying a fixed route.
-        4. "General": Visa (standalone), Weather, Policy.
+        Day Tour Products: {day_products}
+        Task: Classify intent.
+        1. "MultiDay": Package tours (5+ days).
+        2. "DayTour: [Name]": Specific day trip.
+        3. "Charter": Custom route.
+        4. "General": Others.
         """
         try:
             res = self.model_flash.generate_content(prompt)
@@ -195,56 +251,39 @@ class SmartAgent:
         if not AI_KEY: return "❌ 错误: 未配置 API Key"
         engine = self.model_pro if model == "pro" else self.model_flash
         
-        # 严格的业务规则
         business_rules = """
-        [BUSINESS RULES - DO NOT VIOLATE]
-        1. **Scope**: If answer is NOT in context/docs, output: "请联系对应产品经理了解".
-        2. **Multi-day Tours**: 
-           - Quote 'Starting Price' found in docs.
-           - MUST say: "价格仅供参考，最终库存和售价请点击链接二次确认".
-           - Visa/Flight: Assume NOT included unless explicitly stated.
-        3. **Day Tours**: 
-           - Calculate total price based on Pax.
-           - MUST say: "价格已确认，但余位需后台二次确认".
-        4. **Charter**: Give estimated range, refer to PM for final quote.
-        5. **Format**: Use the separators strictly for frontend parsing.
+        RULES:
+        1. If not in docs, output: "请联系对应产品经理了解".
+        2. Multi-day: Quote starting price + "点击链接二次确认".
+        3. Day Tour: Quote calculated price + "余位需后台确认".
+        4. Charter: Estimate range + PM check.
         """
 
         base_prompt = f"""
         Role: Ctrip Senior Sales Consultant.
         Question: "{query}"
         Intent: {intent}
-        
-        Calculated Context: {context}
-        
-        [Raw Data - Multi-day]:
-        {self.kb.multiday_text}
-        
-        [Raw Data - General]:
-        {self.kb.docs_text[:10000]}
-        
+        Context: {context}
+        Multi-day: {self.kb.multiday_text}
+        General: {self.kb.docs_text[:10000]}
         {business_rules}
         
         OUTPUT FORMAT:
         <<<REPLY_A>>>
-        (Quick Reply: < 60 words. Conclusion + Disclaimer)
+        (Quick Reply)
         <<<END_A>>>
-
         <<<REPLY_B>>>
-        (Pro Reply: Greeting -> Detail -> Upsell -> Disclaimer)
+        (Pro Reply)
         <<<END_B>>>
-
         <<<THOUGHTS>>>
-        (Logic: Source file? Calculation?)
+        (Logic)
         <<<END_THOUGHTS>>>
         """
-        try:
-            return engine.generate_content(base_prompt).text
-        except Exception as e:
-            return f"❌ AI Error: {e}"
+        try: return engine.generate_content(base_prompt).text
+        except: return "AI Error"
 
 # ==========================================
-# 4. 前端界面 (自动复制兜底)
+# 4. 前端界面
 # ==========================================
 def main():
     if 'kb' not in st.session_state:
@@ -257,18 +296,15 @@ def main():
     with st.sidebar:
         st.title("⚙️ 知识库监控")
         if 'kb' in st.session_state:
-            # 实时显示加载数量
             counts = st.session_state.kb.loaded_counts
             c1, c2 = st.columns(2)
             c1.metric("一日游线路", counts["DayTour"])
             c2.metric("包车线路", counts["Charter"])
-            c3, c4 = st.columns(2)
-            c3.metric("酒店数据", counts["Hotel"])
-            c4.metric("文档", counts["Docs"])
             
-            with st.expander("查看加载日志"):
+            with st.expander("📊 查看加载日志 (排查错误)"):
                 for log in st.session_state.kb.load_status:
                     if "❌" in log: st.error(log)
+                    elif "⚠️" in log: st.warning(log)
                     elif "✅" in log: st.success(log)
                     else: st.write(log)
         
@@ -278,9 +314,9 @@ def main():
         model = st.radio("AI 模型", ["Gemini 3 Fast", "Gemini 3 Pro"])
 
     st.title("👩‍💼 Ctrip 客服 Copilot")
-    st.info("💡 销售提醒：多日游需查链接库存 | 一日游需查后台余位 | 未知问题找PM")
+    st.caption("✅ 已加载: 多日游文档 | 一日游价格表 | 包车表 | 酒店日历")
 
-    user_input = st.chat_input("输入问题... (如: 有没有关西5日游？富士山一日游含餐吗？)")
+    user_input = st.chat_input("输入问题... (如: 富士山一日游多少钱？)")
 
     if user_input and 'kb' in st.session_state:
         agent = st.session_state.agent
@@ -288,75 +324,59 @@ def main():
         
         with st.chat_message("user"): st.write(user_input)
         
-        # 1. 分析阶段
-        with st.status("🧠 全局数据检索中...", expanded=True) as status:
+        with st.status("🧠 分析意图与库存...", expanded=True) as status:
             raw_intent = agent.semantic_match_product(user_input)
-            st.write(f"🔍 意图识别: **{raw_intent}**")
+            st.write(f"🔍 意图: **{raw_intent}**")
             
             context = ""
-            
-            # --- 分支逻辑 ---
             if "DayTour:" in raw_intent:
                 p_name = raw_intent.split(":")[1]
                 if p_name in kb.prices:
                     info = kb.prices[p_name]
-                    # 查找包含'结算'的价格列
+                    # 智能寻找价格列 (找'结算')
                     p_col = next((c for c in info if '结算' in c), None)
                     if p_col:
                         unit = float(info[p_col])
                         total = unit * pax
-                        context = f"Product: {p_name}, Unit: {unit}, Total: {total} (Pax: {pax})."
+                        context = f"Product: {p_name}, Unit: {unit}, Pax: {pax}, Total: {total}. Status: Price OK, Check Seats."
                     else:
-                        context = f"Product {p_name} found, but price column missing."
-                else:
-                    context = "Product recognized but not in price list."
-            
+                        context = f"Found {p_name} but NO price column."
+                else: context = "Product name recognized but not in Excel."
             elif raw_intent == "MultiDay":
-                context = "User asks about Multi-day. CHECK 'multiday_text' for details."
-            
+                context = "Multi-day intent. Check multiday_text."
             elif raw_intent == "Charter":
-                context = "User asks for Charter. Suggest approx price + PM check."
-            
+                context = "Charter intent."
             else:
-                context = "General Question. Check Docs."
+                context = "General Q&A."
 
-            status.update(label="✅ 数据准备就绪", state="complete", expanded=False)
+            status.update(label="✅ 完成", state="complete", expanded=False)
 
-        # 2. 生成阶段
         with st.chat_message("assistant"):
             sel_model = "flash" if "Fast" in model else "pro"
             raw_text = agent.generate_response(user_input, raw_intent, context, sel_model)
             
-            # 3. 强力解析 (防止断行/格式错误)
-            try:
-                part_a = re.search(r'<<<REPLY_A>>>([\s\S]*?)<<<END_A>>>', raw_text).group(1).strip()
+            # 解析
+            try: part_a = re.search(r'<<<REPLY_A>>>([\s\S]*?)<<<END_A>>>', raw_text).group(1).strip()
             except: part_a = None
-            
-            try:
-                part_b = re.search(r'<<<REPLY_B>>>([\s\S]*?)<<<END_B>>>', raw_text).group(1).strip()
+            try: part_b = re.search(r'<<<REPLY_B>>>([\s\S]*?)<<<END_B>>>', raw_text).group(1).strip()
             except: part_b = None
-            
-            try:
-                thoughts = re.search(r'<<<THOUGHTS>>>([\s\S]*?)<<<END_THOUGHTS>>>', raw_text).group(1).strip()
+            try: thoughts = re.search(r'<<<THOUGHTS>>>([\s\S]*?)<<<END_THOUGHTS>>>', raw_text).group(1).strip()
             except: thoughts = None
 
-            # 4. 展示 (强制显示复制框)
             st.subheader("📋 选项 A：极简版")
-            if part_a:
-                st.code(part_a, language=None)
-            else:
-                st.warning("⚠️ 格式自适应模式")
-                st.code(raw_text, language=None) # 兜底
+            if part_a: st.code(part_a, language=None)
+            else: 
+                st.warning("⚠️ 格式自适应")
+                st.code(raw_text, language=None)
 
             if part_b:
                 st.subheader("💼 选项 B：专业版")
                 st.code(part_b, language=None)
 
-            with st.expander("🧠 AI 思考与建议"):
+            with st.expander("🧠 AI 思考"):
                 if thoughts: st.markdown(thoughts)
                 else: st.write("无")
 
-        # 工具箱
         if raw_intent == "Charter" or "包车" in user_input:
             with st.expander("🧰 距离校验工具", expanded=True):
                 c1, c2 = st.columns(2)
