@@ -95,7 +95,7 @@ def get_ai_reply(query, history, kb_text, model_choice):
        - **Focus**: Search ONLY in Multi-day package docs.
        - **ISOLATION**: DO NOT reference or query the standalone "Hotel Rates" or "Charter" tables. Ignore them.
        - **ACTION**: You MUST extract the **Product ID** (e.g., 66316588) and generate a URL in Reply B.
-       - **URL Format**: `https://vacations.ctrip.com/travel/detail/{{ID}}`
+       - **URL Format**: `https://hk.trip.com/package-tours/detail//{{ID}}`
     
     2. **IF User asks about DAY TOURS (<=3 days)**:
        - Focus: Search Day Tour tables.
@@ -118,7 +118,7 @@ def get_ai_reply(query, history, kb_text, model_choice):
     (Professional Plan:
      - **Product Details**: ...
      - **Cost Breakdown**: ...
-     - **LINK** (For Multi-day): 🔗 [点击查看实时库存 & 价格](https://vacations.ctrip.com/travel/detail/{{ID}})
+     - **LINK** (For Multi-day): 🔗 [点击查看实时库存 & 价格](https://hk.trip.com/package-tours/detail//{{ID}})
     )
     <<<END_B>>>
 
@@ -320,3 +320,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
