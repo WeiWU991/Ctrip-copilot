@@ -6,6 +6,7 @@ import googlemaps
 import google.generativeai as genai
 from datetime import datetime
 import io
+import re
 
 # ==========================================
 # 1. 基础配置
@@ -26,284 +27,224 @@ if AI_KEY:
     except: pass
 
 # ==========================================
-# 2. 万能知识库 (Excel/MD -> 纯文本)
+# 2. 知识库加载器 (万能文本模式)
 # ==========================================
 class KnowledgeBase:
     def __init__(self):
         self.full_text = ""
-        self.source_files = []
+        self.files_loaded = []
 
     def load_all(self):
-        """将所有文件(Excel/CSV/MD)都转化为文本喂给AI"""
-        combined_text = []
-        
-        # 1. 读取 Excel/CSV (转化为 Markdown 表格文本)
+        combined = []
+        # 1. 读表格 (Excel/CSV) -> 转 Markdown 文本
         data_files = glob.glob('*.xlsx') + glob.glob('*.xls') + glob.glob('*.csv')
         for f in data_files:
             try:
-                # 简单读取，不纠结表头，全部转为字符串
                 if f.endswith('.csv'): df = pd.read_csv(f, header=None)
                 else: df = pd.read_excel(f, header=None)
-                
-                # 清洗空数据
-                df = df.dropna(how='all')
-                
-                # 转为 Markdown 文本
-                table_md = df.to_markdown(index=False)
-                combined_text.append(f"\n\n=== 数据来源: {os.path.basename(f)} ===\n{table_md}")
-                self.source_files.append(f)
-            except Exception as e:
-                print(f"Error loading {f}: {e}")
-
-        # 2. 读取 Markdown 文档
+                df = df.dropna(how='all') # 去空行
+                # 转换成文本表格喂给AI
+                combined.append(f"\n\n=== 数据表: {os.path.basename(f)} ===\n{df.to_markdown(index=False)}")
+                self.files_loaded.append(f)
+            except: pass
+        
+        # 2. 读文档 (Markdown)
         md_files = glob.glob('*.md')
         for f in md_files:
             try:
-                with open(f, 'r', encoding='utf-8') as file:
-                    content = file.read()
-                    combined_text.append(f"\n\n=== 知识文档: {os.path.basename(f)} ===\n{content}")
-                    self.source_files.append(f)
+                content = open(f, 'r', encoding='utf-8').read()
+                combined.append(f"\n\n=== 业务文档: {os.path.basename(f)} ===\n{content}")
+                self.files_loaded.append(f)
             except: pass
             
-        self.full_text = "\n".join(combined_text)
-        return len(self.source_files)
+        self.full_text = "\n".join(combined)
 
 # ==========================================
-# 3. 业务工具 (地图 & AI)
+# 3. 核心功能函数
 # ==========================================
-def calculate_route(start, end, waypoints):
-    """Google Maps 距离/时间计算 + 画图"""
-    if not gmaps: return None
-    try:
-        now = datetime.now()
-        # 路线规划
-        directions = gmaps.directions(
-            start, end, 
-            waypoints=waypoints, 
-            mode="driving", 
-            departure_time=now,
-            optimize_waypoints=True
-        )
-        
-        if not directions: return {"valid": False, "msg": "未找到路线，请检查地名"}
-        
-        leg = directions[0]['legs'][0] # 简化处理，取第一段汇总
-        total_dist_m = sum(l['distance']['value'] for l in directions[0]['legs'])
-        total_dur_s = sum(l['duration']['value'] for l in directions[0]['legs'])
-        
-        dist_km = round(total_dist_m / 1000, 1)
-        dur_h = round(total_dur_s / 3600, 1)
-        
-        # 静态地图
-        poly = directions[0]['overview_polyline']['points']
-        markers = [
-            {'color':'green', 'label':'S', 'locations':[start]},
-            {'color':'red', 'label':'E', 'locations':[end]}
-        ]
-        if waypoints:
-            markers.append({'color':'blue', 'label':'W', 'locations':waypoints})
-            
-        map_img = gmaps.static_map(
-            size=(600, 300), 
-            path=f"enc:{poly}", 
-            markers=markers, 
-            maptype="roadmap", 
-            format="png"
-        )
-        
-        return {
-            "valid": True,
-            "dist_km": dist_km,
-            "dur_h": dur_h,
-            "map_img": map_img,
-            "raw_route": f"{start} -> {waypoints} -> {end}"
-        }
-    except Exception as e:
-        return {"valid": False, "msg": str(e)}
-
-def get_ai_response(query, context, kb_text, model_choice):
-    if not AI_KEY: return "❌ 请配置 Google API Key"
+def get_ai_reply(query, context, model_type="pro"):
+    """AI 对话核心"""
+    if not AI_KEY: return "❌ 未配置 API Key"
     
-    model_id = "gemini-1.5-pro" if model_choice == "pro" else "gemini-1.5-flash"
+    model_id = "gemini-1.5-pro" if model_type == "pro" else "gemini-1.5-flash"
     model = genai.GenerativeModel(model_id)
     
-    # 核心业务逻辑 Prompt
     prompt = f"""
-    Role: Senior Travel Consultant at Ctrip (携程).
-    Mission: Provide professional, accurate, and safe travel solutions.
+    Role: Ctrip Senior Travel Consultant.
     
-    [STRICT KNOWLEDGE BOUNDARY]
-    1. Answer ONLY based on the provided [Knowledge Base].
-    2. If the user asks about something NOT in the Knowledge Base (e.g., a city or product not listed), reply exactly: "该回答超出知识库范畴，请咨询对应产品经理".
-    3. Do NOT hallucinate prices or services.
-
-    [CURRENCY & PRICE RULES]
-    1. STRICTLY distinguish currencies found in the data (RMB, JPY, HKD). Label them clearly.
-    2. Charter Price Formula: (Car Base Price found in data) + 1000 RMB (Guide Fee).
+    [STRICT KNOWLEDGE BASE]:
+    {context[:28000]} 
     
-    [CHARTER SAFETY RULES] (Apply ONLY if Context indicates Charter/Custom tour)
-    1. Max Duration: 10 Hours/day.
-    2. Max Distance: 300 KM/day.
-    3. If user's plan exceeds these limits (see Context for Google Maps data), you MUST:
-       - Warn the user clearly.
-       - Act as a consultant: Suggest splitting the trip into 2 days or removing distant spots.
+    [BUSINESS RULES]:
+    1. **Boundary**: Answer ONLY based on the Knowledge Base. If user asks about a product not listed, reply: "该产品需单询，请联系产品经理".
+    2. **Multi-day Tours**: Quote 'Starting Price' found in docs. MUST add disclaimer: "起价仅供参考，最终库存和售价请点击链接二次确认".
+    3. **Day Tours**: Quote the price found in tables. MUST add disclaimer: "价格已含车费，但余位需后台二次确认".
+    4. **Currency**: Pay attention to RMB vs JPY vs HKD in the docs. Output clearly.
     
-    [Knowledge Base]:
-    {kb_text[:25000]} 
+    [USER QUESTION]: "{query}"
     
-    [Current Context / Map Data]:
-    {context}
+    [OUTPUT FORMAT]:
+    Please separate your answer into two parts for copy-paste:
     
-    [User Question]:
-    "{query}"
+    <<<REPLY_A>>>
+    (Quick Reply: < 60 words. Conclusion + Price + Link/Disclaimer)
+    <<<END_A>>>
     
-    [Output Format]:
-    Please output TWO parts separated by lines:
-    
-    ---REPLY_A---
-    (Quick Reply: Conclusion + Price + Key Safety Warning if any. < 80 words)
-    ---END_A---
-    
-    ---REPLY_B---
-    (Professional Consultant Reply:
-     - Clear breakdown of costs (Car + Guide).
-     - Route analysis (based on map data).
-     - Safety/Time management advice.
-     - Upsell or Adjustments if needed.)
-    ---END_B---
+    <<<REPLY_B>>>
+    (Professional Reply: Warm greeting -> Details -> Upsell -> Disclaimer)
+    <<<END_B>>>
     """
-    
+    try: return model.generate_content(prompt).text
+    except Exception as e: return f"AI Error: {e}"
+
+def calc_map_route(start, end, stops):
+    """地图计算核心"""
+    if not gmaps: return {"valid": False, "msg": "API未连接"}
     try:
-        return model.generate_content(prompt).text
-    except Exception as e:
-        return f"AI Error: {e}"
+        now = datetime.now()
+        res = gmaps.directions(start, end, waypoints=stops, mode="driving", departure_time=now, optimize_waypoints=True)
+        if not res: return {"valid": False, "msg": "未找到路线，请检查地名"}
+        
+        route = res[0]
+        dist_km = round(sum(l['distance']['value'] for l in route['legs'])/1000, 1)
+        dur_h = round(sum(l['duration']['value'] for l in route['legs'])/3600, 1)
+        
+        # 静态地图
+        poly = route['overview_polyline']['points']
+        markers = [{'color':'green','label':'S','locations':[start]},{'color':'red','label':'E','locations':[end]}]
+        if stops: markers.append({'color':'blue','label':'P','locations':stops})
+        
+        img_raw = gmaps.static_map(size=(800,400), path=f"enc:{poly}", markers=markers, format="png")
+        img_bytes = io.BytesIO()
+        for chunk in img_raw: img_bytes.write(chunk)
+        
+        return {"valid":True, "dist":dist_km, "dur":dur_h, "img":img_bytes, "legs": len(route['legs'])}
+    except Exception as e: return {"valid": False, "msg": str(e)}
 
 # ==========================================
-# 4. 前端交互
+# 4. 前端界面 (双 Tab 架构)
 # ==========================================
 def main():
-    # --- 初始化 ---
     if 'kb' not in st.session_state:
         kb = KnowledgeBase()
         kb.load_all()
         st.session_state.kb = kb
-        st.session_state.map_result = None # 存储地图结果
+        st.session_state.messages = [] # 聊天记录
 
-    # --- 侧边栏 ---
-    with st.sidebar:
-        st.title("⚙️ 控制台")
-        st.write(f"📚 知识库: 已加载 {len(st.session_state.kb.source_files)} 个文件")
+    st.title("👩‍💼 Ctrip 客服 Copilot")
+    
+    # --- 核心：两个独立 Tab ---
+    tab_chat, tab_plan = st.tabs(["💬 智能问答 (标准品)", "🗺️ 包车规划 (定制)"])
+
+    # ==================================
+    # TAB 1: 智能问答 (AI Chat)
+    # ==================================
+    with tab_chat:
+        st.caption(f"📚 知识库已就绪 ({len(st.session_state.kb.files_loaded)} 个文件) | 适用于：一日游/多日游/签证/天气/退改")
         
-        st.divider()
-        st.subheader("🗺️ 包车行程规划工具")
-        st.caption("当一日游无法满足时，请在此规划包车")
+        # 聊天历史显示
+        for msg in st.session_state.messages:
+            with st.chat_message(msg["role"]):
+                if msg["type"] == "text": st.markdown(msg["content"])
+                elif msg["type"] == "code": st.code(msg["content"], language=None)
         
-        with st.form("map_form"):
-            start = st.text_input("起点", "大阪市区酒店")
-            end = st.text_input("终点", "大阪市区酒店")
-            waypoints_txt = st.text_area("途经点 (一行一个)", "清水寺\n奈良公园")
-            submitted = st.form_submit_button("🚀 校验行程 & 测距")
+        # 输入框
+        user_input = st.chat_input("输入客人问题... (例: 富士山一日游含餐吗？)")
+        
+        if user_input:
+            # 用户消息上屏
+            st.session_state.messages.append({"role":"user", "type":"text", "content":user_input})
+            with st.chat_message("user"): st.write(user_input)
             
-            if submitted:
-                if not gmaps:
-                    st.error("Google Maps API 未连接")
-                else:
-                    wps = [w.strip() for w in waypoints_txt.split('\n') if w.strip()]
-                    with st.spinner("正在测算路况..."):
-                        res = calculate_route(start, end, wps)
-                        st.session_state.map_result = res
+            # AI 回答
+            with st.chat_message("assistant"):
+                with st.spinner("查询知识库中..."):
+                    raw_res = get_ai_reply(user_input, st.session_state.kb.full_text)
+                    
+                    # 解析 A/B 两个版本
+                    try:
+                        reply_a = raw_res.split("<<<REPLY_A>>>")[1].split("<<<END_A>>>")[0].strip()
+                        reply_b = raw_res.split("<<<REPLY_B>>>")[1].split("<<<END_B>>>")[0].strip()
+                    except:
+                        reply_a = raw_res # 兜底
+                        reply_b = None
+                    
+                    st.subheader("📋 极简回复")
+                    st.code(reply_a, language=None)
+                    st.session_state.messages.append({"role":"assistant", "type":"code", "content":reply_a})
+                    
+                    if reply_b:
+                        st.subheader("💼 专业回复")
+                        st.code(reply_b, language=None)
+                        # 专业版不存入历史，避免刷屏，仅供当前查看
+
+    # ==================================
+    # TAB 2: 包车规划 (Workbench)
+    # ==================================
+    with tab_plan:
+        c1, c2 = st.columns([1, 2])
         
-        # 显示地图结果 (侧边栏)
-        if st.session_state.map_result:
-            res = st.session_state.map_result
-            if res.get('valid'):
-                st.image(io.BytesIO(b"".join(res['map_img'])), caption="行程路线图", use_container_width=True)
+        with c1:
+            st.markdown("### 🛠️ 行程参数")
+            with st.form("plan_form"):
+                start = st.text_input("起点", "大阪市区酒店")
+                end = st.text_input("终点", "大阪市区酒店")
+                stops_txt = st.text_area("途经景点 (一行一个)", "清水寺\n奈良公园")
                 
-                # 距离/时间 颜色警示
-                d_color = "red" if res['dist_km'] > 300 else "green"
-                t_color = "red" if res['dur_h'] > 10 else "green"
+                st.divider()
+                st.markdown("#### 💰 价格计算器")
+                base_price = st.number_input("车辆底价 (查表得)", value=2500, step=100)
+                guide_fee = st.number_input("导游服务费 (固定)", value=1000, disabled=True)
                 
-                st.markdown(f"**距离**: :{d_color}[{res['dist_km']} km] (限300)")
-                st.markdown(f"**耗时**: :{t_color}[{res['dur_h']} h] (限10)")
+                btn_calc = st.form_submit_button("🚀 校验行程 & 算价")
+        
+        with c2:
+            st.markdown("### 🗺️ 规划结果")
+            if btn_calc:
+                stops = [s.strip() for s in stops_txt.split('\n') if s.strip()]
+                res = calc_map_route(start, end, stops)
                 
-                if res['dist_km'] > 300 or res['dur_h'] > 10:
-                    st.error("⚠️ 行程超限！建议调整或拆分为2天")
+                if res['valid']:
+                    # 1. 价格计算
+                    total_price = base_price + guide_fee
+                    
+                    # 2. 风控检查
+                    is_safe_dist = res['dist'] <= 300
+                    is_safe_time = res['dur'] <= 10
+                    
+                    # 3. 显示地图
+                    st.image(res['img'], use_container_width=True, caption="Google Maps 实时路况")
+                    
+                    # 4. 数据看板
+                    k1, k2, k3 = st.columns(3)
+                    k1.metric("总里程", f"{res['dist']} km", delta="正常" if is_safe_dist else "超限!", delta_color="normal" if is_safe_dist else "inverse")
+                    k2.metric("预估耗时", f"{res['dur']} h", delta="正常" if is_safe_time else "超限!", delta_color="normal" if is_safe_time else "inverse")
+                    k3.metric("参考总价", f"¥{total_price}", f"含导游 (底价{base_price})")
+                    
+                    st.divider()
+                    
+                    # 5. 生成话术
+                    st.markdown("#### 📋 包车回复话术 (一键复制)")
+                    
+                    safety_msg = ""
+                    if not is_safe_dist: safety_msg += f"\n⚠️ 警告：行程全长 {res['dist']}km，超过每日 300km 安全限制，建议拆分行程。"
+                    if not is_safe_time: safety_msg += f"\n⚠️ 警告：预计耗时 {res['dur']}小时，接近或超过 10小时 服务时长限制，可能产生超时费。"
+                    if is_safe_dist and is_safe_time: safety_msg = "\n✅ 行程合理，符合安全规范。"
+
+                    reply_text = f"""【包车行程方案】
+📍 路线：{start} -> {' -> '.join(stops)} -> {end}
+🚗 车型：10座海狮（参考）
+📏 数据：全程约 {res['dist']}公里，预计用时 {res['dur']}小时
+💰 费用：¥{total_price} (含车辆底价+导游服务费，不含超时费/高速费)
+📝 评估：{safety_msg}
+💡 提示：最终价格请以此方案咨询产品经理进行锁位。"""
+                    
+                    st.code(reply_text, language=None)
+                    
                 else:
-                    st.success("✅ 行程合理")
+                    st.error(f"地图计算失败: {res['msg']}")
             else:
-                st.error(f"地图错误: {res.get('msg')}")
-
-    # --- 主界面 ---
-    st.title("👩‍💼 Ctrip 智能顾问")
-    st.caption("多日游/一日游/包车全能助手 | 严格遵循知识库 | 智能风控")
-
-    # 聊天记录容器
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg.get("image"):
-                st.image(msg["image"])
-
-    # 输入框
-    prompt = st.chat_input("输入客人咨询... (例: 大阪去京都奈良包车多少钱？)")
-
-    if prompt:
-        # 1. 用户提问
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.write(prompt)
-
-        # 2. 准备上下文 (Context)
-        context_str = ""
-        map_image = None
-        
-        # 如果刚才进行了地图测算，把测算结果喂给 AI
-        if st.session_state.map_result and st.session_state.map_result.get('valid'):
-            res = st.session_state.map_result
-            context_str += f"""
-            [User Charter Plan Data from Google Maps]
-            - Route: {res['raw_route']}
-            - Total Distance: {res['dist_km']} km
-            - Total Duration: {res['dur_h']} hours
-            - Safety Status: {'RISKY (Exceeds Limit)' if (res['dist_km']>300 or res['dur_h']>10) else 'SAFE'}
-            """
-            map_image = io.BytesIO(b"".join(res['map_img']))
-        
-        # 3. AI 回答
-        with st.chat_message("assistant"):
-            with st.spinner("AI 正在查阅知识库并计算..."):
-                raw_reply = get_ai_response(
-                    prompt, 
-                    context_str, 
-                    st.session_state.kb.full_text, 
-                    "pro" # 默认用 Pro 模型以保证逻辑
-                )
-                
-                # 尝试解析
-                try:
-                    reply_a = raw_reply.split("---REPLY_A---")[1].split("---END_A---")[0].strip()
-                    reply_b = raw_reply.split("---REPLY_B---")[1].split("---END_B---")[0].strip()
-                except:
-                    reply_a = "解析格式失败，请参考下方全文"
-                    reply_b = raw_reply
-
-                # 展示逻辑
-                st.subheader("📋 极简回复 (可复制)")
-                st.code(reply_a, language=None)
-                
-                st.subheader("💼 专业顾问回复")
-                st.code(reply_b, language=None)
-                
-                # 如果是包车场景且有地图，显示地图
-                if map_image and ("包车" in prompt or "charter" in prompt.lower() or "定制" in prompt):
-                    st.image(map_image, caption="AI 生成的行程规划图")
-                    st.caption("✅ 已基于 Google Maps 实际路况生成")
-        
-        # 存入历史 (简化存储)
-        st.session_state.messages.append({"role": "assistant", "content": reply_b, "image": map_image if ("包车" in prompt) else None})
+                st.info("👈 请在左侧输入行程并点击校验")
 
 if __name__ == "__main__":
     main()
