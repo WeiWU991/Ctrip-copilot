@@ -72,7 +72,7 @@ def transcribe_audio(audio_bytes):
     if not AI_KEY: return None
     try:
         # 使用 Flash 模型，速度最快
-        model = genai.GenerativeModel("gemini-1.5-flash") 
+        model = genai.GenerativeModel("gemini-3-flash-preview") 
         response = model.generate_content([
             {"mime_type": "audio/wav", "data": audio_bytes},
             "Please transcribe what the user said in this audio strictly into text. Do not answer the question, just transcribe. If it's Chinese, output Chinese."
@@ -320,3 +320,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
