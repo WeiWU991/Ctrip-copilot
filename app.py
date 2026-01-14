@@ -71,7 +71,7 @@ def transcribe_audio(audio_bytes):
     """直接利用 Gemini 的多模态能力听懂语音"""
     if not AI_KEY: return None
     try:
-        # 使用 Flash 模型，速度最快
+        # [修正] 严格使用 gemini-3-flash-preview
         model = genai.GenerativeModel("gemini-3-flash-preview") 
         response = model.generate_content([
             {"mime_type": "audio/wav", "data": audio_bytes},
@@ -85,7 +85,9 @@ def transcribe_audio(audio_bytes):
 # --- B. 智能对话 AI ---
 def get_ai_reply(query, history, kb_text, model_choice):
     if not AI_KEY: return "❌ 错误：未配置 API Key"
+    # [修正] 严格锁定模型 ID
     model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
+    
     try: model = genai.GenerativeModel(model_id)
     except Exception as e: return f"模型初始化失败: {e}"
     
@@ -133,7 +135,9 @@ def get_ai_reply(query, history, kb_text, model_choice):
 # --- C. 专属行程生成 AI ---
 def generate_itinerary_text(start, end, optimized_stops, dist, dur, price, model_choice):
     if not AI_KEY: return "API Key Missing"
+    # [修正] 严格锁定模型 ID
     model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
+    
     model = genai.GenerativeModel(model_id)
     
     prompt = f"""
@@ -214,10 +218,10 @@ def main():
         
         st.divider()
         model_choice = st.radio("AI 模型", ["Gemini 3 Flash", "Gemini 3 Pro"])
+        st.caption("🚀 Model ID: `gemini-3-flash-preview` / `gemini-3-pro-preview`")
 
     st.title("Ctrip 服务专家 Co-Pilot")
     
-    # 顶部语音条 (Demo 炫技入口)
     st.caption("🎙️ 语音输入 (Demo): 点击录音，AI 自动识别")
     audio_val = st.audio_input("按住说话 (支持中/英/日混说)")
 
@@ -225,7 +229,6 @@ def main():
 
     # === TAB 1: 智能问答 ===
     with tab_chat:
-        # 1. 历史渲染
         for msg in st.session_state.messages:
             if msg['role'] == 'user':
                 with st.chat_message("user"): st.write(msg['content'])
@@ -236,31 +239,26 @@ def main():
                         st.markdown(msg['long'])
                         st.info(msg['thoughts'])
 
-        # 2. 输入处理逻辑 (语音 OR 文本)
         final_query = None
         
         # 优先级 A: 语音输入
         if audio_val:
-            with st.spinner("🎙️ 正在识别语音..."):
+            with st.spinner("🎙️ 正在听写..."):
                 transcribed_text = transcribe_audio(audio_val.getvalue())
                 if transcribed_text:
                     final_query = transcribed_text
-                    # 语音识别后，把文字显示出来，增加可信度
                     st.info(f"🗣️ 识别结果: {final_query}")
 
-        # 优先级 B: 文本输入 (只有在没语音时才看文本框)
-        # 注意：Streamlit 的机制是 input 只有在回车时才会有值，
-        # 为了避免语音和文本框冲突，通常演示时二选一操作
+        # 优先级 B: 文本输入
         text_input = st.chat_input("输入需求... (例: 大阪到京都包车)")
         if text_input and not final_query:
             final_query = text_input
 
-        # 3. 触发 AI 回答
         if final_query:
-            # 防止重复提交 (简单去重: 如果最后一条是相同的 query 就不再发)
-            if not st.session_state.messages or st.session_state.messages[-1]['content'] != final_query:
+            # [核心修复] 使用 .get('content') 避免 KeyError
+            if not st.session_state.messages or st.session_state.messages[-1].get('content') != final_query:
                 st.session_state.messages.append({"role": "user", "content": final_query})
-                # 如果是文本输入，这里需要手动上屏(因为rerun慢)，如果是语音，上面已经 info 显示了
+                
                 if not audio_val:
                     with st.chat_message("user"): st.write(final_query)
 
@@ -320,4 +318,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
