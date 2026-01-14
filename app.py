@@ -95,7 +95,7 @@ def get_ai_reply(query, history, kb_text, model_choice):
        - **Focus**: Search ONLY in Multi-day package docs.
        - **ISOLATION**: DO NOT reference or query the standalone "Hotel Rates" or "Charter" tables. Ignore them.
        - **ACTION**: You MUST extract the **Product ID** (e.g., 66316588) and generate a URL in Reply B.
-       - **URL Format**: `https://hk.trip.com/package-tours/detail//{{ID}}`
+       - **URL Format**: `https://vacations.ctrip.com/travel/detail/{{ID}}`
     
     2. **IF User asks about DAY TOURS (<=3 days)**:
        - Focus: Search Day Tour tables.
@@ -118,7 +118,7 @@ def get_ai_reply(query, history, kb_text, model_choice):
     (Professional Plan:
      - **Product Details**: ...
      - **Cost Breakdown**: ...
-     - **LINK** (For Multi-day): 🔗 [点击查看实时库存 & 价格](https://hk.trip.com/package-tours/detail//{{ID}})
+     - **LINK** (For Multi-day): 🔗 [点击查看实时库存 & 价格](https://vacations.ctrip.com/travel/detail/{{ID}})
     )
     <<<END_B>>>
 
@@ -134,14 +134,15 @@ def get_ai_reply(query, history, kb_text, model_choice):
     except Exception as e: return f"AI Error: {str(e)}"
 
 # --- B. 专属行程生成 AI (用于 Tab 2) ---
+# [核心更新]: 加入了营业时间校验 (Operating Hours Check)
 def generate_itinerary_text(start, end, optimized_stops, dist, dur, price, model_choice):
-    """专门用于 Tab 2：生成分钟级行程表"""
+    """专门用于 Tab 2：生成分钟级行程表，并校验营业时间"""
     if not AI_KEY: return "API Key Missing"
     model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
     model = genai.GenerativeModel(model_id)
     
     prompt = f"""
-    Role: Professional Travel Planner.
+    Role: Professional Travel Planner & Risk Control Specialist.
     Task: Create a detailed, attractive daily itinerary based on the provided technical route data.
     
     [TECHNICAL DATA]:
@@ -152,23 +153,28 @@ def generate_itinerary_text(start, end, optimized_stops, dist, dur, price, model
     - Total Driving Time: {dur} hours
     - Total Price: {price} RMB (Car + Guide)
     
-    [REQUIREMENTS]:
-    1. **Timeline**: Start at 09:00. Breakdown the day into travel time and play time.
-       - Allocate reasonable time for each stop (e.g., 1-2 hours).
-       - Ensure the day ends within 10 hours (approx 19:00).
-    2. **Tone**: Professional, inviting, structured.
-    3. **Format**: Markdown. Use emojis.
-    
+    [CRITICAL REQUIREMENT - OPERATING HOURS CHECK]:
+    1. **Knowledge Retrieval**: Use your internal knowledge to check the standard opening/closing hours for each stop.
+    2. **Logic Check**: 
+       - If the timeline suggests arriving at a spot after it closes (e.g., Nijo Castle at 18:00), you MUST mark it with "🔴 风险: 可能已闭馆".
+       - If the spot is open 24h (e.g., parks, streets), no warning needed.
+    3. **Toll Hint**: Since precise toll prices are unavailable via API, just add a generic note: "*(行程涉及高速，如有过路费请实报实销)*".
+
     [OUTPUT TEMPLATE]:
     ### 🗓️ 推荐行程安排 (已优化路线)
     * **09:00** 🏨 酒店出发: 司机在 {start} 大堂等候
     * **09:00 - 10:00** 🚗 前往第一站...
+    * **10:00 - 11:30** 🏯 **[景点名]** (游玩约 1.5h)
+       * *[Optional: Add a 1-sentence highlight]*
     * ... (Generate the rest)
     * **19:00** 🏁 结束行程: 送回 {end}
     
     ---
     💰 **费用明细**: {price}元 (含车+导，10小时/300公里)
-    💡 **规划师建议**: (Why is this route good?)
+    🚧 **路况与服务提示**: 
+    1. 行程全长约 {dist}km，预计行车 {dur}小时。
+    2. *(行程涉及高速，如有过路费请实报实销)*
+    💡 **规划师建议**: (Why is this route good? Any closure warnings?)
     """
     try: return model.generate_content(prompt).text
     except: return "行程生成超时，请重试。"
@@ -246,7 +252,7 @@ def main():
                 with st.chat_message("assistant"):
                     st.code(msg['short'], language=None)
                     with st.expander("🔽 查看详细行程 & 诊断"):
-                        st.markdown(msg['long']) # 注意：这里改用 markdown 渲染，因为里面可能有链接
+                        st.markdown(msg['long'])
                         st.info(msg['thoughts'])
 
         # 输入
@@ -268,7 +274,7 @@ def main():
 
                     st.code(r_a, language=None)
                     with st.expander("🔽 查看详细行程 & 诊断", expanded=True):
-                        st.markdown(r_b) # 使用 Markdown 渲染以支持超链接
+                        st.markdown(r_b) 
                         st.info(th)
                     
                     st.session_state.messages.append({"role": "assistant", "short": r_a, "long": r_b, "thoughts": th})
@@ -281,7 +287,7 @@ def main():
             with st.form("charter_v2"):
                 start = st.text_input("📍 起点", "大阪希尔顿酒店")
                 end = st.text_input("🏁 终点", "大阪希尔顿酒店")
-                stops = st.text_area("🎡 途经景点 (一行一个)", "奈良公园\n清水寺\n伏见稻荷大社")
+                stops = st.text_area("🎡 途经景点 (一行一个)", "奈良公园\n二条城\n清水寺")
                 price_base = st.number_input("💰 车辆底价 (RMB)", 2500, step=100)
                 
                 submitted = st.form_submit_button("🚀 生成优化后行程单")
@@ -299,8 +305,8 @@ def main():
                     # 2. 算总价
                     total_price = price_base + 1000
                     
-                    # 3. AI 生成详细时间表
-                    with st.spinner("正在生成分钟级行程表..."):
+                    # 3. AI 生成详细时间表 (含营业时间风控)
+                    with st.spinner("正在校验景点营业时间并排期..."):
                         plan_text = generate_itinerary_text(
                             start, end, res['optimized_stops'], 
                             res['dist'], res['dur'], total_price, model_choice
@@ -320,5 +326,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
