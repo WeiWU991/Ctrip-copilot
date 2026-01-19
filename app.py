@@ -11,7 +11,7 @@ import re
 # ==========================================
 # 1. 基础配置
 # ==========================================
-st.set_page_config(page_title="Ctrip CS Copilot", page_icon="👩‍💼", layout="wide")
+st.set_page_config(page_title="Ctrip 服务专家 Co-Pilot", page_icon="👩‍💼", layout="wide")
 
 MAPS_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
 AI_KEY = st.secrets.get("GOOGLE_API_KEY", "")
@@ -71,7 +71,6 @@ def transcribe_audio(audio_bytes):
     """直接利用 Gemini 的多模态能力听懂语音"""
     if not AI_KEY: return None
     try:
-        # [修正] 严格使用 gemini-3-flash-preview
         model = genai.GenerativeModel("gemini-3-flash-preview") 
         response = model.generate_content([
             {"mime_type": "audio/wav", "data": audio_bytes},
@@ -85,7 +84,6 @@ def transcribe_audio(audio_bytes):
 # --- B. 智能对话 AI ---
 def get_ai_reply(query, history, kb_text, model_choice):
     if not AI_KEY: return "❌ 错误：未配置 API Key"
-    # [修正] 严格锁定模型 ID
     model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
     
     try: model = genai.GenerativeModel(model_id)
@@ -132,29 +130,35 @@ def get_ai_reply(query, history, kb_text, model_choice):
     try: return model.generate_content(system_prompt).text
     except Exception as e: return f"AI Error: {str(e)}"
 
-# --- C. 专属行程生成 AI ---
+# --- C. 专属行程生成 AI (升级版：远观/入内智能判别) ---
 def generate_itinerary_text(start, end, optimized_stops, dist, dur, price, model_choice):
     if not AI_KEY: return "API Key Missing"
-    # [修正] 严格锁定模型 ID
     model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
     
     model = genai.GenerativeModel(model_id)
     
     prompt = f"""
     Role: Professional Travel Planner & Risk Control Specialist.
-    Task: Create a daily itinerary.
+    Task: Create a daily itinerary based on route data.
     
     [DATA]: Start:{start}, End:{end}, Route:{'->'.join(optimized_stops)}, Dist:{dist}km, Time:{dur}h, Price:{price}RMB.
     
+    [INTELLIGENT SCENIC JUDGMENT - IMPORTANT]:
+    1. **Far View (远观) vs Visit (入内)**: Use your common sense to judge the best way to visit each spot.
+       - **Far View (📸 推荐远观)**: Massive natural landmarks (e.g., **Mt. Fuji**, Aso Volcano), City Skylines (e.g., Tokyo Tower exterior). -> **Allocated Time: ~20-40 mins**.
+       - **Visit (🚶 需入内/深度)**: Temples (e.g., Kiyomizu-dera), Parks (e.g., Nara Park), Theme Parks. -> **Allocated Time: ~1.5 - 3 hours**.
+    
     [RULES]:
-    1. **Operating Hours**: Check if arrival time matches spot opening hours. If risky (e.g. arrive at 18:00), mark "🔴 风险: 可能已闭馆".
+    1. **Operating Hours**: Check if arrival time is risky. If risky, mark "🔴 风险: 可能已闭馆".
     2. **Toll Note**: Add "*(行程涉及高速，如有过路费请实报实销)*".
     
     [OUTPUT TEMPLATE]:
     ### 🗓️ 推荐行程安排 (已优化路线)
     * **09:00** 🏨 酒店出发: 司机在 {start} 大堂等候
     * **09:00 - 10:00** 🚗 前往第一站...
-    * **10:00 - 11:30** 🏯 **[景点名]** (游玩约 1.5h)
+    * **10:00 - 10:40** 🗻 **[景点名]** (📸 推荐远观 / ⏰ 停留约40分钟)
+       * *[AI Comment: Why far view? e.g., "富士山全貌建议在河口湖沿岸拍摄，无需上山"]*
+    * **11:00 - 13:00** ⛩️ **[景点名]** (🚶 深度游玩 / ⏰ 停留约2小时)
     * ...
     * **19:00** 🏁 结束行程: 送回 {end}
     
@@ -255,7 +259,6 @@ def main():
             final_query = text_input
 
         if final_query:
-            # [核心修复] 使用 .get('content') 避免 KeyError
             if not st.session_state.messages or st.session_state.messages[-1].get('content') != final_query:
                 st.session_state.messages.append({"role": "user", "content": final_query})
                 
@@ -286,7 +289,7 @@ def main():
             with st.form("charter_v2"):
                 start = st.text_input("📍 起点", "大阪希尔顿酒店")
                 end = st.text_input("🏁 终点", "大阪希尔顿酒店")
-                stops = st.text_area("🎡 途经景点 (一行一个)", "奈良公园\n二条城\n清水寺")
+                stops = st.text_area("🎡 途经景点 (一行一个)", "富士山\n清水寺\n奈良公园")
                 price_base = st.number_input("💰 车辆底价 (RMB)", 2500, step=100)
                 submitted = st.form_submit_button("🚀 生成优化后行程单")
         
@@ -300,7 +303,7 @@ def main():
                     st.image(res['img'], use_container_width=True, caption="Google Maps 优化路线预览")
                     total_price = price_base + 1000
                     
-                    with st.spinner("正在校验营业时间..."):
+                    with st.spinner("AI 正在判断景点游玩性质(远观/入内)..."):
                         plan_text = generate_itinerary_text(
                             start, end, res['optimized_stops'], 
                             res['dist'], res['dur'], total_price, model_choice
