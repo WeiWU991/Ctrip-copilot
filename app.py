@@ -2,10 +2,7 @@ import streamlit as st
 import pandas as pd
 import glob
 import os
-import googlemaps
 import google.generativeai as genai
-from datetime import datetime, timedelta
-import io
 import re
 
 # ==========================================
@@ -13,14 +10,8 @@ import re
 # ==========================================
 st.set_page_config(page_title="Ctrip 服务专家 Co-Pilot", page_icon="👩‍💼", layout="wide")
 
-MAPS_KEY = st.secrets.get("GOOGLE_MAPS_API_KEY", "")
+# 地图 Key 已移除，因为不做包车了
 AI_KEY = st.secrets.get("GOOGLE_API_KEY", "")
-
-# 初始化
-gmaps = None
-if MAPS_KEY:
-    try: gmaps = googlemaps.Client(key=MAPS_KEY)
-    except: pass
 
 if AI_KEY:
     try: genai.configure(api_key=AI_KEY)
@@ -38,7 +29,7 @@ class KnowledgeBase:
         self.knowledge_text = ""
         self.file_status = []
         
-        # 1. Markdown (核心)
+        # 1. Markdown (核心：多日游产品)
         md_files = glob.glob('*.md')
         for f in md_files:
             try:
@@ -48,27 +39,27 @@ class KnowledgeBase:
             except: 
                 self.file_status.append(f"❌ 读取失败: {f}")
 
-        # 2. Simple Excel (列表)
+        # 2. Simple Excel (虽然不做单项，但可能需要参考价格，暂保留或根据需求移除)
         data_files = glob.glob('*.xlsx') + glob.glob('*.csv')
         for f in data_files:
-            if any(k in f.upper() for k in ["HOTEL", "OSAKA", "SHINJUKU", "PLAZA", "WASHINGTON"]):
-                self.file_status.append(f"⚠️ 跳过复杂Excel: {f} (请用 Markdown 维护)")
+            # 过滤掉酒店/单项资源，因为我们只卖打包
+            if any(k in f.upper() for k in ["HOTEL", "OSAKA", "SHINJUKU"]):
+                self.file_status.append(f"⚠️ 已忽略单项资源表: {f}")
                 continue
             try:
                 if f.endswith('.csv'): df = pd.read_csv(f, header=None)
                 else: df = pd.read_excel(f, header=None)
                 df = df.dropna(how='all')
-                self.knowledge_text += f"\n\n=== 价格表: {os.path.basename(f)} ===\n{df.to_markdown(index=False)}"
+                self.knowledge_text += f"\n\n=== 参考资料: {os.path.basename(f)} ===\n{df.to_markdown(index=False)}"
                 self.file_status.append(f"✅ 已加载表格: {f}")
             except: pass
 
 # ==========================================
-# 3. AI 核心 (语音 & 对话 & 规划)
+# 3. AI 核心 (语音 & 纯多日游对话)
 # ==========================================
 
-# --- A. 语音转文字 (Gemini Native) ---
+# --- A. 语音转文字 ---
 def transcribe_audio(audio_bytes):
-    """直接利用 Gemini 的多模态能力听懂语音"""
     if not AI_KEY: return None
     try:
         model = genai.GenerativeModel("gemini-3-flash-preview") 
@@ -81,7 +72,7 @@ def transcribe_audio(audio_bytes):
         st.error(f"语音识别失败: {e}")
         return None
 
-# --- B. 智能对话 AI ---
+# --- B. 智能对话 AI (严格拦截一日游/包车) ---
 def get_ai_reply(query, history, kb_text, model_choice):
     if not AI_KEY: return "❌ 错误：未配置 API Key"
     model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
@@ -91,12 +82,12 @@ def get_ai_reply(query, history, kb_text, model_choice):
     
     history_str = ""
     for msg in history[-5:]: 
-        # 只拼接用户的输入和 AI 的简短回答，避免上下文过大
         if msg['role'] == 'user': history_str += f"User: {msg['content']}\n"
         elif msg['role'] == 'assistant': history_str += f"AI: {msg.get('short', '')}\n"
 
+    # [UPDATED PROMPT]: 严格的业务边界设定
     system_prompt = f"""
-    Role: Senior Travel Planner & Consultant at Ctrip.
+    Role: Senior Travel Consultant at Ctrip (Multi-Day Package Team).
     
     [MEMORY]:
     {history_str}
@@ -104,104 +95,50 @@ def get_ai_reply(query, history, kb_text, model_choice):
     [KNOWLEDGE BASE]:
     {kb_text}
 
+    [BUSINESS RULES - STRICT SCOPE]:
+    1. **SCOPE**: This team ONLY sells **Multi-Day Packages (Group Tours / Private Packages > 3 days)**.
+    2. **OUT OF SCOPE**: 
+       - **Day Tours (一日游)**: REJECT.
+       - **Charter Services (包车/用车)**: REJECT.
+       - **Single Items (Ticket/Hotel only)**: REJECT.
+    
     [LOGIC BRANCHING]:
-    1. **MULTI-DAY (>4 days)**: Search Multi-day docs only. Extract Product ID -> URL `https://vacations.ctrip.com/travel/detail/{{ID}}`. Ignore hotels/charters.
-    2. **DAY TOURS (<=3 days)**: Search Day Tour tables. Atomic products. Mentioned spots=Included. Lunch=Included unless 'Self-pay'.
-    3. **CUSTOM/CHARTER**: Base Price + **1000 RMB Guide Fee**. Provide Timeline (09:00 -> 10:00...).
+    1. **IF User asks for DAY TOUR / CHARTER / SHORT TRIP**:
+       - **Action**: Politely DECLINE.
+       - **Script**: "抱歉，我们部门专注于【长线多日打包行程】（如5日游、7日游等），暂不承接单独的一日游或包车业务。如果您需要规划完整行程，我很乐意为您介绍我们的热销线路。"
+       - **Do NOT** provide prices or plans for charters. Stop there.
+
+    2. **IF User asks about MULTI-DAY PACKAGES**:
+       - **Focus**: Search in knowledge base.
+       - **Action**: Answer detailly + Extract Product ID -> URL `https://vacations.ctrip.com/travel/detail/{{ID}}`. 
+       - **Tone**: Professional, sales-oriented.
 
     [USER QUERY]: "{query}"
 
     [OUTPUT FORMAT]:
     <<<REPLY_A>>>
-    (Quick Conclusion + Price + Key Disclaimer. < 60 words)
+    (Quick Conclusion. If declined, keep it polite but firm. < 60 words)
     <<<END_A>>>
     
     <<<REPLY_B>>>
-    (Professional Plan:
-     - **Product Details**: ...
-     - **Cost Breakdown**: ...
-     - **LINK** (For Multi-day): 🔗 [点击查看实时库存 & 价格](https://vacations.ctrip.com/travel/detail/{{ID}})
+    (Professional Response:
+     - **If Out of Scope**: Explain scope + Ask if user wants a multi-day trip instead.
+     - **If In Scope**: Product Details + Cost + LINK.
     )
     <<<END_B>>>
 
     <<<THOUGHTS>>>
-    (中文诊断: 1.意图 2.屏蔽酒店? 3.链接生成? 4.价格逻辑?)
+    (中文诊断: 
+     1. 意图识别 (包车/一日游 vs 多日游)?
+     2. 是否执行了拦截逻辑? 
+     3. 链接生成?)
     <<<END_THOUGHTS>>>
     """
     try: return model.generate_content(system_prompt).text
     except Exception as e: return f"AI Error: {str(e)}"
 
-# --- C. 专属行程生成 AI (升级版：远观/入内智能判别) ---
-def generate_itinerary_text(start, end, optimized_stops, dist, dur, price, model_choice):
-    if not AI_KEY: return "API Key Missing"
-    model_id = "gemini-3-flash-preview" if "Flash" in model_choice else "gemini-3-pro-preview"
-    
-    model = genai.GenerativeModel(model_id)
-    
-    prompt = f"""
-    Role: Professional Travel Planner & Risk Control Specialist.
-    Task: Create a daily itinerary based on route data.
-    
-    [DATA]: Start:{start}, End:{end}, Route:{'->'.join(optimized_stops)}, Dist:{dist}km, Time:{dur}h, Price:{price}RMB.
-    
-    [INTELLIGENT SCENIC JUDGMENT - IMPORTANT]:
-    1. **Far View (远观) vs Visit (入内)**: Use your common sense to judge the best way to visit each spot.
-       - **Far View (📸 推荐远观)**: Massive natural landmarks (e.g., **Mt. Fuji**, Aso Volcano), City Skylines (e.g., Tokyo Tower exterior). -> **Allocated Time: ~20-40 mins**.
-       - **Visit (🚶 需入内/深度)**: Temples (e.g., Kiyomizu-dera), Parks (e.g., Nara Park), Theme Parks. -> **Allocated Time: ~1.5 - 3 hours**.
-    
-    [RULES]:
-    1. **Operating Hours**: Check if arrival time is risky. If risky, mark "🔴 风险: 可能已闭馆".
-    2. **Toll Note**: Add "*(行程涉及高速，如有过路费请实报实销)*".
-    
-    [OUTPUT TEMPLATE]:
-    ### 🗓️ 推荐行程安排 (已优化路线)
-    * **09:00** 🏨 酒店出发: 司机在 {start} 大堂等候
-    * **09:00 - 10:00** 🚗 前往第一站...
-    * **10:00 - 10:40** 🗻 **[景点名]** (📸 推荐远观 / ⏰ 停留约40分钟)
-       * *[AI Comment: Why far view? e.g., "富士山全貌建议在河口湖沿岸拍摄，无需上山"]*
-    * **11:00 - 13:00** ⛩️ **[景点名]** (🚶 深度游玩 / ⏰ 停留约2小时)
-    * ...
-    * **19:00** 🏁 结束行程: 送回 {end}
-    
-    ---
-    💰 **费用明细**: {price}元 (含车+导，10小时/300公里)
-    🚧 **路况与服务提示**: 
-    1. 行程全长约 {dist}km，预计行车 {dur}小时。
-    2. *(行程涉及高速，如有过路费请实报实销)*
-    💡 **规划师建议**: ...
-    """
-    try: return model.generate_content(prompt).text
-    except: return "行程生成超时，请重试。"
-
 # ==========================================
-# 4. 地图工具
-# ==========================================
-def calc_map_route(start, end, stops):
-    if not gmaps: return {"valid": False, "msg": "API未连接"}
-    try:
-        now = datetime.now()
-        res = gmaps.directions(start, end, waypoints=stops, mode="driving", departure_time=now, optimize_waypoints=True)
-        # 如果返回空列表，通常是地名无法识别或无路可走
-        if not res: return {"valid": False, "msg": "无路线 (请检查地名是否准确，如 '富士山' 可改为 '河口湖')"}
-        
-        route = res[0]
-        order_indices = route.get('waypoint_order', list(range(len(stops))))
-        optimized_stops = [stops[i] for i in order_indices]
-        
-        dist = round(sum(l['distance']['value'] for l in route['legs'])/1000, 1)
-        dur = round(sum(l['duration']['value'] for l in route['legs'])/3600, 1)
-        
-        poly = route['overview_polyline']['points']
-        markers = [{'color':'green','label':'S','locations':[start]},{'color':'red','label':'E','locations':[end]}]
-        if stops: markers.append({'color':'blue','label':'P','locations':stops})
-        
-        img_raw = gmaps.static_map(size=(800,400), path=f"enc:{poly}", markers=markers, format="png")
-        
-        return {"valid":True, "dist":dist, "dur":dur, "img":io.BytesIO(b"".join(img_raw)), "optimized_stops":optimized_stops}
-    except Exception as e: return {"valid": False, "msg": str(e)}
-
-# ==========================================
-# 5. 前端主程序
+# 4. 前端主程序 (移除 Tab 2)
 # ==========================================
 def main():
     if 'kb' not in st.session_state:
@@ -218,7 +155,6 @@ def main():
                 if "✅" in s: st.success(s)
                 else: st.warning(s)
         
-        # [建议] 报错后请点击此按钮
         if st.button("🗑️ 清空对话 (接待新客)", type="primary"):
             st.session_state.messages = []
             st.rerun()
@@ -228,101 +164,61 @@ def main():
         st.caption("🚀 Model ID: `gemini-3-flash-preview` / `gemini-3-pro-preview`")
 
     st.title("Ctrip 服务专家 Co-Pilot")
-    
-    st.caption("🎙️ 语音输入 (Demo): 点击录音，AI 自动识别")
+    st.caption("🎙️ 语音输入: 点击录音，AI 自动识别")
     audio_val = st.audio_input("按住说话 (支持中/英/日混说)")
 
-    tab_chat, tab_plan = st.tabs(["💬 智能问答", "🗺️ 包车规划"])
+    # [移除 Tabs] 只保留单一聊天界面
+    # tab_chat, tab_plan = st.tabs(["💬 智能问答", "🗺️ 包车规划"]) 
+    
+    # 直接展示聊天界面
+    for msg in st.session_state.messages:
+        if msg['role'] == 'user':
+            with st.chat_message("user"): st.write(msg['content'])
+        elif msg['role'] == 'assistant':
+            with st.chat_message("assistant"):
+                st.code(msg.get('short', '...'), language=None)
+                with st.expander("🔽 查看详细行程 & 诊断"):
+                    st.markdown(msg.get('long', ''))
+                    st.info(msg.get('thoughts', ''))
 
-    # === TAB 1: 智能问答 ===
-    with tab_chat:
-        for msg in st.session_state.messages:
-            if msg['role'] == 'user':
-                with st.chat_message("user"): st.write(msg['content'])
-            elif msg['role'] == 'assistant':
-                with st.chat_message("assistant"):
-                    # 使用 .get() 避免报错
-                    st.code(msg.get('short', '...'), language=None)
-                    with st.expander("🔽 查看详细行程 & 诊断"):
-                        st.markdown(msg.get('long', ''))
-                        st.info(msg.get('thoughts', ''))
+    final_query = None
+    
+    # 优先级 A: 语音输入
+    if audio_val:
+        with st.spinner("🎙️ 正在听写..."):
+            transcribed_text = transcribe_audio(audio_val.getvalue())
+            if transcribed_text:
+                final_query = transcribed_text
+                st.info(f"🗣️ 识别结果: {final_query}")
 
-        final_query = None
-        
-        # 优先级 A: 语音输入
-        if audio_val:
-            with st.spinner("🎙️ 正在听写..."):
-                transcribed_text = transcribe_audio(audio_val.getvalue())
-                if transcribed_text:
-                    final_query = transcribed_text
-                    st.info(f"🗣️ 识别结果: {final_query}")
+    # 优先级 B: 文本输入
+    text_input = st.chat_input("输入需求... (例: 有没有关西5日游？)")
+    if text_input and not final_query:
+        final_query = text_input
 
-        # 优先级 B: 文本输入
-        text_input = st.chat_input("输入需求... (例: 大阪到京都包车)")
-        if text_input and not final_query:
-            final_query = text_input
+    if final_query:
+        if not st.session_state.messages or st.session_state.messages[-1].get('content') != final_query:
+            st.session_state.messages.append({"role": "user", "content": final_query})
+            
+            if not audio_val:
+                with st.chat_message("user"): st.write(final_query)
 
-        if final_query:
-            # [核心修复点] 使用 .get('content') 防止 KeyError
-            if not st.session_state.messages or st.session_state.messages[-1].get('content') != final_query:
-                st.session_state.messages.append({"role": "user", "content": final_query})
-                
-                if not audio_val:
-                    with st.chat_message("user"): st.write(final_query)
+            with st.chat_message("assistant"):
+                with st.spinner("AI 正在思考..."):
+                    raw_res = get_ai_reply(final_query, st.session_state.messages, st.session_state.kb.knowledge_text, model_choice)
+                    try: r_a = re.search(r'<<<REPLY_A>>>([\s\S]*?)<<<END_A>>>', raw_res).group(1).strip()
+                    except: r_a = raw_res
+                    try: r_b = re.search(r'<<<REPLY_B>>>([\s\S]*?)<<<END_B>>>', raw_res).group(1).strip()
+                    except: r_b = "未生成"
+                    try: th = re.search(r'<<<THOUGHTS>>>([\s\S]*?)<<<END_THOUGHTS>>>', raw_res).group(1).strip()
+                    except: th = "无"
 
-                with st.chat_message("assistant"):
-                    with st.spinner("AI 正在思考..."):
-                        raw_res = get_ai_reply(final_query, st.session_state.messages, st.session_state.kb.knowledge_text, model_choice)
-                        try: r_a = re.search(r'<<<REPLY_A>>>([\s\S]*?)<<<END_A>>>', raw_res).group(1).strip()
-                        except: r_a = raw_res
-                        try: r_b = re.search(r'<<<REPLY_B>>>([\s\S]*?)<<<END_B>>>', raw_res).group(1).strip()
-                        except: r_b = "未生成"
-                        try: th = re.search(r'<<<THOUGHTS>>>([\s\S]*?)<<<END_THOUGHTS>>>', raw_res).group(1).strip()
-                        except: th = "无"
-
-                        st.code(r_a, language=None)
-                        with st.expander("🔽 查看详细行程 & 诊断", expanded=True):
-                            st.markdown(r_b) 
-                            st.info(th)
-                        
-                        st.session_state.messages.append({"role": "assistant", "short": r_a, "long": r_b, "thoughts": th})
-
-    # === TAB 2: 包车规划 ===
-    with tab_plan:
-        c1, c2 = st.columns([1, 1.5])
-        with c1:
-            with st.form("charter_v2"):
-                start = st.text_input("📍 起点", "大阪希尔顿酒店")
-                end = st.text_input("🏁 终点", "大阪希尔顿酒店")
-                stops = st.text_area("🎡 途经景点 (一行一个)", "富士山五合目\n清水寺\n奈良公园")
-                price_base = st.number_input("💰 车辆底价 (RMB)", 2500, step=100)
-                submitted = st.form_submit_button("🚀 生成优化后行程单")
-        
-        with c2:
-            if submitted:
-                wps = [s.strip() for s in stops.split('\n') if s.strip()]
-                with st.spinner("正在计算最佳路线 (Google Maps)..."):
-                    res = calc_map_route(start, end, wps)
-                
-                if res['valid']:
-                    st.image(res['img'], use_container_width=True, caption="Google Maps 优化路线预览")
-                    total_price = price_base + 1000
+                    st.code(r_a, language=None)
+                    with st.expander("🔽 查看详细回复 & 诊断", expanded=True):
+                        st.markdown(r_b) 
+                        st.info(th)
                     
-                    with st.spinner("AI 正在判断景点游玩性质(远观/入内)..."):
-                        plan_text = generate_itinerary_text(
-                            start, end, res['optimized_stops'], 
-                            res['dist'], res['dur'], total_price, model_choice
-                        )
-                    
-                    st.markdown("### 📋 定制行程单 (可复制)")
-                    st.code(plan_text, language=None)
-                    
-                    if res['dist'] > 300 or res['dur'] > 10:
-                        st.error(f"⚠️ 风险预警: 里程 {res['dist']}km / 耗时 {res['dur']}h。建议删减。")
-                    else:
-                        st.success("✅ 行程风控通过")
-                else:
-                    st.error(f"地图计算失败: {res['msg']}")
+                    st.session_state.messages.append({"role": "assistant", "short": r_a, "long": r_b, "thoughts": th})
 
 if __name__ == "__main__":
     main()
