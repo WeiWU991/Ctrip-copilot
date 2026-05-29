@@ -199,4 +199,238 @@ def parse_reply(raw_text):
     return {
         "script": extract("对客话术") or "（未生成话术，请重试）",
         "links": extract("产品链接") or "（无匹配产品）",
-        "reason": extract("推荐理由") or "（
+        "reason": extract("推荐理由") or "（无推荐理由）",
+        "diagnosis": extract("内部诊断") or "（无诊断信息）",
+        "raw": raw_text,
+    }
+
+
+# ==========================================
+# 5. 前端主程序
+# ==========================================
+def main():
+    # 加载知识库
+    pf, file_status = load_knowledge_base()
+
+    # 初始化状态
+    if 'messages' not in st.session_state:
+        st.session_state.messages = []
+    if 'total_cost_stats' not in st.session_state:
+        st.session_state.total_cost_stats = {
+            'calls': 0, 'total_tokens': 0,
+            'cache_hit_total': 0, 'cache_miss_total': 0
+        }
+
+    # ===================== 侧边栏 =====================
+    with st.sidebar:
+        st.title("⚙️ 控制台")
+
+        # 知识库状态
+        with st.expander("📚 知识库状态", expanded=True):
+            if pf:
+                stats = pf.stats()
+                col1, col2 = st.columns(2)
+                col1.metric("产品总数", stats['total'])
+                col2.metric("覆盖目的地", stats['destinations'])
+                st.caption(f"平均行程天数: {stats['avg_days']}天")
+                for s in file_status:
+                    if "✅" in s:
+                        st.success(s, icon="✅")
+                    else:
+                        st.warning(s)
+            else:
+                for s in file_status:
+                    st.error(s)
+
+        # 清空记忆
+        st.divider()
+        col1, col2 = st.columns(2)
+        if col1.button("🗑️ 清空对话", type="primary", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
+        if col2.button("📊 重置统计", use_container_width=True):
+            st.session_state.total_cost_stats = {
+                'calls': 0, 'total_tokens': 0,
+                'cache_hit_total': 0, 'cache_miss_total': 0
+            }
+            st.rerun()
+
+        st.caption(f"💬 当前记忆: {len(st.session_state.messages)} 条消息（≈{len(st.session_state.messages)//2} 轮）")
+
+        # 模型选择
+        st.divider()
+        model_choice = st.radio(
+            "🤖 AI 模型",
+            ["DeepSeek V4 Pro", "DeepSeek V4 Flash"],
+            help="Pro：推理强，话术精；Flash：响应快，成本低"
+        )
+        model_id = "deepseek-v4-pro" if "Pro" in model_choice else "deepseek-v4-flash"
+        st.caption(f"Model: `{model_id}`")
+
+        # 筛选参数
+        st.divider()
+        st.markdown("**🎯 筛选参数**")
+        top_k = st.slider("候选产品数量", 3, 15, 8,
+                          help="筛选出的候选产品数。数量越多 AI 选择越丰富，但 token 消耗也增加")
+        max_chars = st.slider("上下文最大字符", 20000, 150000, 80000, step=10000,
+                              help="发给 AI 的产品上下文长度上限")
+
+        # 成本监控
+        st.divider()
+        st.markdown("**💰 本次会话成本监控**")
+        cs = st.session_state.total_cost_stats
+        if cs['calls'] > 0:
+            overall_hit_rate = cs['cache_hit_total'] / max(cs['total_tokens'], 1) * 100
+            st.metric("调用次数", cs['calls'])
+            st.metric("累计 Tokens", f"{cs['total_tokens']:,}")
+            st.metric("缓存命中率", f"{overall_hit_rate:.1f}%",
+                     help="命中率越高越省钱（缓存命中费率约为 1/10）")
+
+            # 估算费用（DeepSeek V4 Pro 参考价格）
+            miss_cost = cs['cache_miss_total'] * 4 / 1_000_000  # ¥4/M tokens
+            hit_cost = cs['cache_hit_total'] * 0.4 / 1_000_000  # ¥0.4/M tokens
+            total_cost = miss_cost + hit_cost
+            st.metric("估算成本", f"¥{total_cost:.4f}")
+        else:
+            st.caption("暂无调用记录")
+
+        # API 连接状态
+        st.divider()
+        st.caption("**🔌 API 状态**")
+        st.caption(f"DeepSeek: {'🟢' if ds_client else '🔴'}")
+        st.caption(f"Gemini 语音: {'🟢' if GEMINI_KEY else '🔴 未配置'}")
+
+    # ===================== 主界面 =====================
+    st.title("👩‍💼 携程产品服务专家 Co-Pilot")
+    st.caption(f"💡 智能预筛选模式 | 在售产品 {pf.stats()['total'] if pf else 0} 个 | 输入客户咨询，AI 自动匹配并生成可发送话术")
+
+    if not pf:
+        st.error("❌ 知识库未加载，请检查目录下是否存在 .md 文件")
+        return
+
+    if not ds_client:
+        st.error("❌ DeepSeek API 未配置，请在 `.streamlit/secrets.toml` 中设置 `DEEPSEEK_API_KEY`")
+        return
+
+    # 语音输入
+    with st.expander("🎙️ 语音输入（可选）"):
+        audio_val = st.audio_input("按住录音 - 支持中/英/日混说")
+
+    # 历史消息渲染
+    for msg in st.session_state.messages:
+        if msg['role'] == 'user':
+            with st.chat_message("user"):
+                st.write(msg['content'])
+        elif msg['role'] == 'assistant':
+            with st.chat_message("assistant"):
+                render_assistant_msg(msg)
+
+    # 输入处理
+    final_query = None
+
+    if audio_val:
+        with st.spinner("🎙️ 语音识别中..."):
+            transcribed = transcribe_audio(audio_val.getvalue())
+            if transcribed:
+                final_query = transcribed
+                st.info(f"🗣️ 识别结果: {transcribed}")
+
+    text_input = st.chat_input("输入客户咨询...（例：济州岛4天3晚有什么推荐）")
+    if text_input and not final_query:
+        final_query = text_input
+
+    if final_query:
+        # 去重防抖
+        if not st.session_state.messages or \
+           st.session_state.messages[-1].get('content') != final_query:
+
+            st.session_state.messages.append({"role": "user", "content": final_query})
+
+            with st.chat_message("user"):
+                st.write(final_query)
+
+            with st.chat_message("assistant"):
+                # 步骤1：预筛选
+                with st.spinner("🔍 正在精筛匹配产品..."):
+                    filtered_context, hit_ids, hit_details = pf.build_context(
+                        final_query, top_k=top_k, max_chars=max_chars
+                    )
+
+                # 显示筛选结果
+                if hit_details:
+                    with st.expander(f"🎯 预筛选命中 {len(hit_details)} 个候选产品", expanded=False):
+                        for d in hit_details:
+                            st.caption(
+                                f"`{d['id']}` | {d['score']}分 | {d['days']}天 | "
+                                f"{d['destination']} | {' '.join(d['reasons'])}"
+                            )
+                            st.caption(f"  └─ {d['title'][:60]}")
+                else:
+                    st.warning("⚠️ 预筛选未命中明确匹配，AI 将引导客户补充信息")
+
+                # 步骤2：调用 DeepSeek
+                with st.spinner(f"🤖 {model_choice} 正在生成话术..."):
+                    raw, usage_info = get_ai_reply(
+                        final_query,
+                        st.session_state.messages[:-1],
+                        filtered_context,
+                        model_id
+                    )
+
+                if raw is None:
+                    st.error("AI 调用失败")
+                    return
+
+                parsed = parse_reply(raw)
+
+                # 更新成本统计
+                if usage_info:
+                    cs = st.session_state.total_cost_stats
+                    cs['calls'] += 1
+                    cs['total_tokens'] += usage_info['prompt_tokens']
+                    cs['cache_hit_total'] += usage_info['cache_hit']
+                    cs['cache_miss_total'] += usage_info['cache_miss']
+
+                # 存入历史 + 渲染
+                msg_data = {
+                    "role": "assistant",
+                    **parsed,
+                    "hit_details": hit_details,
+                    "usage_info": usage_info,
+                }
+                st.session_state.messages.append(msg_data)
+                render_assistant_msg(msg_data)
+
+
+def render_assistant_msg(msg):
+    """统一渲染 AI 回复"""
+    # 1. 对客话术（最显眼，可一键复制）
+    st.markdown("##### 📋 对客话术（一键复制发送给客人）")
+    st.code(msg.get('script', ''), language=None)
+
+    # 2. 产品链接 + 推荐理由（双栏）
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.markdown("##### 🔗 推荐产品链接")
+        st.markdown(msg.get('links', ''))
+    with col2:
+        st.markdown("##### 💡 推荐理由")
+        st.markdown(msg.get('reason', ''))
+
+    # 3. 内部诊断（折叠）
+    with st.expander("🔍 内部诊断（仅客服可见）"):
+        st.info(msg.get('diagnosis', ''))
+
+        # 显示本次 token 使用情况
+        usage = msg.get('usage_info')
+        if usage:
+            st.caption("**本轮 Token 使用：**")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("输入", f"{usage['prompt_tokens']:,}")
+            c2.metric("输出", f"{usage['completion_tokens']:,}")
+            c3.metric("缓存命中", f"{usage['cache_hit']:,}")
+            c4.metric("命中率", f"{usage['hit_rate']:.1f}%")
+
+
+if __name__ == "__main__":
+    main()
