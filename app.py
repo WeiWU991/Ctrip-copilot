@@ -52,7 +52,7 @@ def get_ai_reply(query, history, kb_text):
         return "❌ 错误：未配置 API Key，请检查配置。"
     
     # 按照需求：全局统一使用 gemini-3.5-flash
-    model_id = "gemini-3.5-flash"
+    model_id = "models/gemini-3.5-flash"
     
     try: 
         model = genai.GenerativeModel(model_id)
