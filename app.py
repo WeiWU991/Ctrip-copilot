@@ -1,21 +1,26 @@
 import streamlit as st
 import glob
 import os
-import google.generativeai as genai
 import re
+from openai import OpenAI
 
 # ==========================================
 # 1. 基础配置
 # ==========================================
 st.set_page_config(page_title="携程产品服务专家 Co-Pilot", page_icon="👩‍💼", layout="wide")
 
-# 获取 API Key
-AI_KEY = st.secrets.get("GOOGLE_API_KEY", "")
+# 获取 DeepSeek API Key
+DS_API_KEY = st.secrets.get("DEEPSEEK_API_KEY", "")
 
-if AI_KEY:
-    try: 
-        genai.configure(api_key=AI_KEY)
-    except: 
+# 初始化 OpenAI 客户端 (直接将 Base URL 指向 DeepSeek 的服务器)
+client = None
+if DS_API_KEY:
+    try:
+        client = OpenAI(
+            api_key=DS_API_KEY,
+            base_url="https://api.deepseek.com"
+        )
+    except Exception as e:
         pass
 
 # ==========================================
@@ -30,7 +35,7 @@ class KnowledgeBase:
         self.knowledge_text = ""
         self.file_status = []
         
-        # 核心：读取当前目录下所有的 .md 文件 (如：携程产品行程详情_全量V2.md)
+        # 读取当前目录下所有的 .md 文件 (如：携程产品行程详情_全量V2.md)
         md_files = glob.glob('*.md')
         for f in md_files:
             try:
@@ -45,21 +50,16 @@ class KnowledgeBase:
             self.file_status.append("⚠️ 未在目录下检测到 .md 知识库文件，请确保全量产品文件已上传。")
 
 # ==========================================
-# 3. AI 核心大脑
+# 3. AI 核心大脑 (DeepSeek 版)
 # ==========================================
 def get_ai_reply(query, history, kb_text):
-    if not AI_KEY: 
-        return "❌ 错误：未配置 API Key，请检查配置。"
+    if not client: 
+        return "❌ 错误：未配置 DEEPSEEK_API_KEY，请检查环境配置。"
     
-    # 按照需求：全局统一使用 gemini-3.5-flash
-    model_id = "models/gemini-3.5-flash"
+    # 采用最新一代生产力巅峰：DeepSeek V4-Pro (如果想省钱可以用 deepseek-v4-flash)
+    model_id = "deepseek-v4-pro" 
     
-    try: 
-        model = genai.GenerativeModel(model_id)
-    except Exception as e: 
-        return f"模型初始化失败: {e}"
-    
-    # 组装上下文记忆 (保留最近 5 轮对话以控制 Token)
+    # 组装上下文记忆 (保留最近 5 轮对话)
     history_str = ""
     for msg in history[-5:]: 
         if msg['role'] == 'user': 
@@ -85,8 +85,6 @@ def get_ai_reply(query, history, kb_text):
        - 第二部分是人工客服【直接复制发送给客人的话术】。
     4. **话术标准**：发送给客人的话术必须语气亲切、专业。善用 Emoji 表情，使用清晰的列表或分段排版。务必在话术中带上推荐的**产品编号**或明确的**行程天数及亮点**，方便促单。
 
-    [客人当前消息]: "{query}"
-
     [严格的输出格式]:
     请严格遵循以下标签格式输出，不要更改标签：
     <<<THOUGHTS>>>
@@ -98,9 +96,20 @@ def get_ai_reply(query, history, kb_text):
     <<<END_REPLY>>>
     """
     
+    # DeepSeek 兼容 OpenAI 的 Message 结构
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": query}
+    ]
+
     try: 
-        response = model.generate_content(system_prompt)
-        return response.text
+        response = client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            temperature=0.3, # 稍微调低一点温度，保证检索的严谨性，防止产生幻觉编造产品
+            max_tokens=2048,
+        )
+        return response.choices[0].message.content
     except Exception as e: 
         return f"AI 响应错误: {str(e)}"
 
@@ -132,8 +141,7 @@ def main():
         
         st.divider()
         st.markdown("### 🤖 模型设置")
-        # 直接写死显示当前使用的模型，不需要选择器了
-        st.info("⚡ 当前驱动模型: **Gemini 3.5 Flash**\n\n(已优化长文本检索与响应速度)")
+        st.info("⚡ 当前驱动模型: **DeepSeek V4-Pro**\n\n(已采用最新 API，长文本解析与逻辑推理全面升级)")
 
     # --- 主界面 ---
     st.title("👩‍💼 携程产品服务专家 Co-Pilot")
@@ -148,7 +156,6 @@ def main():
         elif msg['role'] == 'assistant':
             with st.chat_message("assistant"):
                 st.markdown("📋 **提供给客人的话术 (可直接复制):**")
-                # 使用 markdown 语言框方便右上角一键复制
                 st.code(msg.get('reply', '...'), language="markdown") 
                 with st.expander("🧠 查看 AI 内部诊断与匹配思路"):
                     st.markdown(msg.get('thoughts', '无记录'))
@@ -164,8 +171,7 @@ def main():
 
         # 处理 AI 回复
         with st.chat_message("assistant"):
-            with st.spinner("专家正在检索所有产品，为您定制服务话术..."):
-                # 调用时去掉了 model_choice 参数
+            with st.spinner("DeepSeek V4-Pro 正在检索全量产品，为您定制服务话术..."):
                 raw_res = get_ai_reply(user_query, st.session_state.messages, st.session_state.kb.knowledge_text)
                 
                 # 正则提取内部思路和话术
@@ -177,7 +183,6 @@ def main():
                 try: 
                     reply = re.search(r'<<<REPLY>>>([\s\S]*?)<<<END_REPLY>>>', raw_res).group(1).strip()
                 except: 
-                    # 容错：如果没按格式生成，则直接显示全量文本
                     reply = raw_res.replace('<<<THOUGHTS>>>', '').replace('<<<END_THOUGHTS>>>', '')
 
                 # 渲染结果
