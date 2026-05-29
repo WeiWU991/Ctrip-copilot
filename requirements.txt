@@ -3,3 +3,4 @@ pandas
 openpyxl
 googlemaps
 google-generativeai
+openai
