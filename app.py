@@ -134,7 +134,7 @@ SYSTEM_PROMPT = """你是一名携程国旅高端定制团队的资深产品服�
 【工作准则】：
 1. 严格基于精筛产品池回答，绝不编造产品信息、价格或行程细节。
 2. 如果精筛池中没有完全匹配的产品，要诚实告知客户，并推荐池中最接近的1-2个替代方案。
-3. 产品链接统一使用格式：https://vacations.ctrip.com/travel/detail/{产品ID}
+3. 产品链接统一使用格式：https://vacations.ctrip.com/travel/detail/p{产品ID}
 4. 单次回复最多推荐 3 个产品，避免选择困难。
 5. 推荐时优先考虑：目的地匹配 > 天数匹配 > 主题/卖点匹配 > 钻级匹配。
 6. 如果精筛池为空或提示"未找到匹配"，要主动询问客户补充信息（目的地、天数、预算、出行日期、人数等）。
@@ -147,7 +147,7 @@ SYSTEM_PROMPT = """你是一名携程国旅高端定制团队的资深产品服�
 
 <<<产品链接>>>
 （按推荐优先级列出，每行一个，格式：
-- 【产品标题】 https://vacations.ctrip.com/travel/detail/产品ID
+- 【产品标题】 https://vacations.ctrip.com/travel/detail/p产品ID
 ）
 <<<END_产品链接>>>
 
