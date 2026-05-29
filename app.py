@@ -1,10 +1,11 @@
 """
-携程产品服务专家 Co-Pilot
+携程产品服务专家 Co-Pilot - 最终版
 - DeepSeek V4 Pro/Flash
-- 智能预筛选模式（不发全量知识库）
+- 智能预筛选模式
 - 三段式输出 + 内部诊断
 - Context Caching 自动启用
 - 语音输入 + 10轮上下文记忆
+- 知识库加载失败诊断 + 优雅降级
 """
 import streamlit as st
 import glob
@@ -45,29 +46,65 @@ if GEMINI_KEY:
 
 
 # ==========================================
-# 2. 知识库加载（带缓存）
+# 2. 知识库加载（带诊断 + 失败不缓存）
 # ==========================================
 @st.cache_resource(show_spinner="📚 正在加载并解析知识库...")
 def load_knowledge_base():
-    """全局只加载一次，避免每次rerun都重新解析"""
-    md_files = glob.glob('*.md')
+    """成功才缓存；失败时返回None但日志带详细诊断"""
     file_status = []
     full_text = ""
 
+    cwd = os.getcwd()
+    file_status.append(f"📂 工作目录: `{cwd}`")
+
+    try:
+        all_files = sorted(os.listdir(cwd))
+        file_status.append(f"📁 目录下共 {len(all_files)} 个条目")
+        for f in all_files[:30]:
+            file_status.append(f"   • {f}")
+    except Exception as e:
+        file_status.append(f"❌ 无法列出目录: {e}")
+
+    # 多策略搜索 MD 文件
+    md_files = list(set(
+        glob.glob('*.md') +
+        glob.glob('**/*.md', recursive=True) +
+        glob.glob('*.MD') +
+        glob.glob('*.markdown')
+    ))
+
     if not md_files:
-        return None, ["⚠️ 当前目录未找到 .md 文件"]
+        file_status.append("⚠️ **未找到任何 .md 文件！**")
+        file_status.append("💡 请检查 MD 文件是否在仓库根目录")
+        return None, file_status
+
+    file_status.append(f"🔍 找到 {len(md_files)} 个 MD 文件:")
 
     for f in md_files:
         try:
-            content = open(f, 'r', encoding='utf-8').read()
+            with open(f, 'r', encoding='utf-8') as fp:
+                content = fp.read()
             full_text += "\n\n" + content
             size_kb = round(len(content) / 1024, 1)
             file_status.append(f"✅ {f} | {size_kb} KB")
         except Exception as e:
             file_status.append(f"❌ {f}: {e}")
 
-    pf = ProductFilter(full_text)
-    return pf, file_status
+    if not full_text.strip():
+        file_status.append("❌ 所有 MD 文件均为空")
+        return None, file_status
+
+    try:
+        pf = ProductFilter(full_text)
+        if len(pf.products) == 0:
+            file_status.append("⚠️ 解析完成但未识别到产品")
+            file_status.append("💡 请确认 MD 内含 `**产品编号**: 数字` 格式")
+            return None, file_status
+        file_status.append(f"🎯 成功解析 {len(pf.products)} 个产品")
+        return pf, file_status
+    except Exception as e:
+        file_status.append(f"❌ 解析失败: {e}")
+        return None, file_status
 
 
 # ==========================================
@@ -91,13 +128,7 @@ def transcribe_audio(audio_bytes):
 # ==========================================
 # 4. DeepSeek 对话核心
 # ==========================================
-def get_ai_reply(query, history, filtered_context, model_id):
-    """调用 DeepSeek，filtered_context 只包含筛选后的候选产品"""
-    if not ds_client:
-        return None, None
-
-    # System Prompt：放在最前面，命中 Context Caching
-    system_prompt = """你是一名携程国旅高端定制团队的资深产品服务专家。
+SYSTEM_PROMPT = """你是一名携程国旅高端定制团队的资深产品服务专家。
 你的工作是根据客户咨询，从【精筛产品池】中匹配最合适的产品，并生成可直接发送给客人的专业话术。
 
 【工作准则】：
@@ -137,8 +168,12 @@ def get_ai_reply(query, history, filtered_context, model_id):
 <<<END_内部诊断>>>
 """
 
-    # 把筛选后的产品上下文作为 user 消息的一部分发送
-    # （而不是塞进 system prompt，这样 system prompt 保持稳定，更容易命中缓存）
+
+def get_ai_reply(query, history, filtered_context, model_id):
+    """调用 DeepSeek，filtered_context 只包含筛选后的候选产品"""
+    if not ds_client:
+        return None, None
+
     user_content = f"""【精筛产品池】（系统已为本次查询预筛选）：
 {filtered_context}
 
@@ -148,17 +183,13 @@ def get_ai_reply(query, history, filtered_context, model_id):
 
 请按指定格式输出4段内容。"""
 
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # 历史对话（最近10轮 = 20条消息）
     for msg in history[-20:]:
         if msg['role'] == 'user':
             messages.append({"role": "user", "content": msg['content']})
         elif msg['role'] == 'assistant':
-            messages.append({
-                "role": "assistant",
-                "content": msg.get('script', '')
-            })
+            messages.append({"role": "assistant", "content": msg.get('script', '')})
 
     messages.append({"role": "user", "content": user_content})
 
@@ -171,7 +202,6 @@ def get_ai_reply(query, history, filtered_context, model_id):
             stream=False,
         )
 
-        # 提取 usage（包含缓存命中信息）
         usage = response.usage
         usage_info = {
             'prompt_tokens': usage.prompt_tokens,
@@ -192,12 +222,18 @@ def get_ai_reply(query, history, filtered_context, model_id):
 
 def parse_reply(raw_text):
     """解析四段式输出"""
+    if not raw_text:
+        return {
+            "script": "（AI 无返回）", "links": "", "reason": "",
+            "diagnosis": "", "raw": ""
+        }
+
     def extract(tag):
         m = re.search(rf'<<<{tag}>>>([\s\S]*?)<<<END_{tag}>>>', raw_text)
         return m.group(1).strip() if m else ""
 
     return {
-        "script": extract("对客话术") or "（未生成话术，请重试）",
+        "script": extract("对客话术") or raw_text[:300],
         "links": extract("产品链接") or "（无匹配产品）",
         "reason": extract("推荐理由") or "（无推荐理由）",
         "diagnosis": extract("内部诊断") or "（无诊断信息）",
@@ -206,7 +242,45 @@ def parse_reply(raw_text):
 
 
 # ==========================================
-# 5. 前端主程序
+# 5. UI 渲染辅助
+# ==========================================
+def render_assistant_msg(msg):
+    """统一渲染 AI 回复"""
+    st.markdown("##### 📋 对客话术（一键复制发送给客人）")
+    st.code(msg.get('script', ''), language=None)
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.markdown("##### 🔗 推荐产品链接")
+        st.markdown(msg.get('links', '') or "_（无）_")
+    with col2:
+        st.markdown("##### 💡 推荐理由")
+        st.markdown(msg.get('reason', '') or "_（无）_")
+
+    with st.expander("🔍 内部诊断（仅客服可见）"):
+        st.info(msg.get('diagnosis', '') or "_（无）_")
+
+        usage = msg.get('usage_info')
+        if usage:
+            st.caption("**本轮 Token 使用：**")
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("输入", f"{usage['prompt_tokens']:,}")
+            c2.metric("输出", f"{usage['completion_tokens']:,}")
+            c3.metric("缓存命中", f"{usage['cache_hit']:,}")
+            c4.metric("命中率", f"{usage['hit_rate']:.1f}%")
+
+        hits = msg.get('hit_details')
+        if hits:
+            st.caption("**预筛选命中产品：**")
+            for d in hits:
+                st.caption(
+                    f"`{d['id']}` | {d['score']}分 | {d['days']}天 | "
+                    f"{d['destination']} | {' '.join(d['reasons'])}"
+                )
+
+
+# ==========================================
+# 6. 主程序
 # ==========================================
 def main():
     # 加载知识库
@@ -226,43 +300,50 @@ def main():
         st.title("⚙️ 控制台")
 
         # 知识库状态
-        with st.expander("📚 知识库状态", expanded=True):
+        with st.expander("📚 知识库状态", expanded=(pf is None)):
             if pf:
                 stats = pf.stats()
-                col1, col2 = st.columns(2)
-                col1.metric("产品总数", stats['total'])
-                col2.metric("覆盖目的地", stats['destinations'])
+                c1, c2 = st.columns(2)
+                c1.metric("产品总数", stats['total'])
+                c2.metric("目的地数", stats['destinations'])
                 st.caption(f"平均行程天数: {stats['avg_days']}天")
-                for s in file_status:
-                    if "✅" in s:
-                        st.success(s, icon="✅")
-                    else:
-                        st.warning(s)
-            else:
-                for s in file_status:
-                    st.error(s)
+                st.divider()
 
-        # 清空记忆
+            for s in file_status:
+                if "✅" in s or "🎯" in s:
+                    st.success(s)
+                elif "❌" in s:
+                    st.error(s)
+                elif "⚠️" in s:
+                    st.warning(s)
+                else:
+                    st.caption(s)
+
+            if st.button("🔄 重新加载知识库", use_container_width=True):
+                load_knowledge_base.clear()
+                st.rerun()
+
+        # 操作按钮
         st.divider()
-        col1, col2 = st.columns(2)
-        if col1.button("🗑️ 清空对话", type="primary", use_container_width=True):
+        c1, c2 = st.columns(2)
+        if c1.button("🗑️ 清空对话", type="primary", use_container_width=True):
             st.session_state.messages = []
             st.rerun()
-        if col2.button("📊 重置统计", use_container_width=True):
+        if c2.button("📊 重置统计", use_container_width=True):
             st.session_state.total_cost_stats = {
                 'calls': 0, 'total_tokens': 0,
                 'cache_hit_total': 0, 'cache_miss_total': 0
             }
             st.rerun()
 
-        st.caption(f"💬 当前记忆: {len(st.session_state.messages)} 条消息（≈{len(st.session_state.messages)//2} 轮）")
+        st.caption(f"💬 当前记忆: {len(st.session_state.messages)} 条（≈{len(st.session_state.messages)//2} 轮）")
 
         # 模型选择
         st.divider()
         model_choice = st.radio(
             "🤖 AI 模型",
             ["DeepSeek V4 Pro", "DeepSeek V4 Flash"],
-            help="Pro：推理强，话术精；Flash：响应快，成本低"
+            help="Pro：推理强、话术精；Flash：响应快、成本低"
         )
         model_id = "deepseek-v4-pro" if "Pro" in model_choice else "deepseek-v4-flash"
         st.caption(f"Model: `{model_id}`")
@@ -270,10 +351,8 @@ def main():
         # 筛选参数
         st.divider()
         st.markdown("**🎯 筛选参数**")
-        top_k = st.slider("候选产品数量", 3, 15, 8,
-                          help="筛选出的候选产品数。数量越多 AI 选择越丰富，但 token 消耗也增加")
-        max_chars = st.slider("上下文最大字符", 20000, 150000, 80000, step=10000,
-                              help="发给 AI 的产品上下文长度上限")
+        top_k = st.slider("候选产品数量", 3, 15, 8)
+        max_chars = st.slider("上下文最大字符", 20000, 150000, 80000, step=10000)
 
         # 成本监控
         st.divider()
@@ -282,35 +361,41 @@ def main():
         if cs['calls'] > 0:
             overall_hit_rate = cs['cache_hit_total'] / max(cs['total_tokens'], 1) * 100
             st.metric("调用次数", cs['calls'])
-            st.metric("累计 Tokens", f"{cs['total_tokens']:,}")
-            st.metric("缓存命中率", f"{overall_hit_rate:.1f}%",
-                     help="命中率越高越省钱（缓存命中费率约为 1/10）")
-
-            # 估算费用（DeepSeek V4 Pro 参考价格）
-            miss_cost = cs['cache_miss_total'] * 4 / 1_000_000  # ¥4/M tokens
-            hit_cost = cs['cache_hit_total'] * 0.4 / 1_000_000  # ¥0.4/M tokens
-            total_cost = miss_cost + hit_cost
-            st.metric("估算成本", f"¥{total_cost:.4f}")
+            st.metric("累计输入 Tokens", f"{cs['total_tokens']:,}")
+            st.metric("缓存命中率", f"{overall_hit_rate:.1f}%")
+            miss_cost = cs['cache_miss_total'] * 4 / 1_000_000
+            hit_cost = cs['cache_hit_total'] * 0.4 / 1_000_000
+            st.metric("估算成本(¥)", f"{miss_cost + hit_cost:.4f}")
         else:
             st.caption("暂无调用记录")
 
-        # API 连接状态
+        # API 状态
         st.divider()
         st.caption("**🔌 API 状态**")
-        st.caption(f"DeepSeek: {'🟢' if ds_client else '🔴'}")
-        st.caption(f"Gemini 语音: {'🟢' if GEMINI_KEY else '🔴 未配置'}")
+        st.caption(f"DeepSeek: {'🟢 已连接' if ds_client else '🔴 未配置'}")
+        st.caption(f"Gemini 语音: {'🟢 已连接' if GEMINI_KEY else '🔴 未配置'}")
 
     # ===================== 主界面 =====================
     st.title("👩‍💼 携程产品服务专家 Co-Pilot")
-    st.caption(f"💡 智能预筛选模式 | 在售产品 {pf.stats()['total'] if pf else 0} 个 | 输入客户咨询，AI 自动匹配并生成可发送话术")
 
+    # 兜底：知识库未加载
     if not pf:
-        st.error("❌ 知识库未加载，请检查目录下是否存在 .md 文件")
+        st.error("❌ **知识库未加载**")
+        st.markdown("""
+        请检查：
+        1. ✅ MD 文件已推送到 GitHub 仓库**根目录**
+        2. ✅ Streamlit Cloud 已 Reboot（Manage app → Reboot app）
+        3. ✅ 文件未被 `.gitignore` 忽略
+
+        👈 **请展开左侧"知识库状态"查看详细诊断信息**，或点击"🔄 重新加载知识库"
+        """)
         return
 
     if not ds_client:
-        st.error("❌ DeepSeek API 未配置，请在 `.streamlit/secrets.toml` 中设置 `DEEPSEEK_API_KEY`")
+        st.error("❌ DeepSeek API 未配置，请在 `.streamlit/secrets.toml` 设置 `DEEPSEEK_API_KEY`")
         return
+
+    st.caption(f"💡 智能预筛选模式 | 在售产品 {pf.stats()['total']} 个 | 输入客户咨询，AI 自动匹配并生成可发送话术")
 
     # 语音输入
     with st.expander("🎙️ 语音输入（可选）"):
@@ -340,7 +425,7 @@ def main():
         final_query = text_input
 
     if final_query:
-        # 去重防抖
+        # 去重
         if not st.session_state.messages or \
            st.session_state.messages[-1].get('content') != final_query:
 
@@ -350,13 +435,12 @@ def main():
                 st.write(final_query)
 
             with st.chat_message("assistant"):
-                # 步骤1：预筛选
+                # Step 1: 预筛选
                 with st.spinner("🔍 正在精筛匹配产品..."):
                     filtered_context, hit_ids, hit_details = pf.build_context(
                         final_query, top_k=top_k, max_chars=max_chars
                     )
 
-                # 显示筛选结果
                 if hit_details:
                     with st.expander(f"🎯 预筛选命中 {len(hit_details)} 个候选产品", expanded=False):
                         for d in hit_details:
@@ -368,7 +452,7 @@ def main():
                 else:
                     st.warning("⚠️ 预筛选未命中明确匹配，AI 将引导客户补充信息")
 
-                # 步骤2：调用 DeepSeek
+                # Step 2: 调用 DeepSeek
                 with st.spinner(f"🤖 {model_choice} 正在生成话术..."):
                     raw, usage_info = get_ai_reply(
                         final_query,
@@ -400,36 +484,6 @@ def main():
                 }
                 st.session_state.messages.append(msg_data)
                 render_assistant_msg(msg_data)
-
-
-def render_assistant_msg(msg):
-    """统一渲染 AI 回复"""
-    # 1. 对客话术（最显眼，可一键复制）
-    st.markdown("##### 📋 对客话术（一键复制发送给客人）")
-    st.code(msg.get('script', ''), language=None)
-
-    # 2. 产品链接 + 推荐理由（双栏）
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        st.markdown("##### 🔗 推荐产品链接")
-        st.markdown(msg.get('links', ''))
-    with col2:
-        st.markdown("##### 💡 推荐理由")
-        st.markdown(msg.get('reason', ''))
-
-    # 3. 内部诊断（折叠）
-    with st.expander("🔍 内部诊断（仅客服可见）"):
-        st.info(msg.get('diagnosis', ''))
-
-        # 显示本次 token 使用情况
-        usage = msg.get('usage_info')
-        if usage:
-            st.caption("**本轮 Token 使用：**")
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("输入", f"{usage['prompt_tokens']:,}")
-            c2.metric("输出", f"{usage['completion_tokens']:,}")
-            c3.metric("缓存命中", f"{usage['cache_hit']:,}")
-            c4.metric("命中率", f"{usage['hit_rate']:.1f}%")
 
 
 if __name__ == "__main__":
