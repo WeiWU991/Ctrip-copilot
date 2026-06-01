@@ -1,12 +1,11 @@
 """
-携程产品服务专家 Co-Pilot - 最终版
-- DeepSeek V4 Pro/Flash
-- 智能预筛选模式
-- 三段式输出 + 内部诊断
-- Context Caching 自动启用
-- 语音输入 + 10轮上下文记忆
-- 知识库加载失败诊断 + 优雅降级
+携程产品服务专家 Co-Pilot V3
+- DeepSeek V4 Pro / Flash
+- 智能预筛选
+- 支持追问、序号指代、产品ID精确查询
+- 携程链接格式：/detail/p{产品ID}
 """
+
 import streamlit as st
 import glob
 import os
@@ -15,6 +14,7 @@ from openai import OpenAI
 import google.generativeai as genai
 
 from product_filter import ProductFilter
+
 
 # ==========================================
 # 1. 基础配置
@@ -46,11 +46,10 @@ if GEMINI_KEY:
 
 
 # ==========================================
-# 2. 知识库加载（带诊断 + 失败不缓存）
+# 2. 知识库加载
 # ==========================================
 @st.cache_resource(show_spinner="📚 正在加载并解析知识库...")
 def load_knowledge_base():
-    """成功才缓存；失败时返回None但日志带详细诊断"""
     file_status = []
     full_text = ""
 
@@ -59,13 +58,12 @@ def load_knowledge_base():
 
     try:
         all_files = sorted(os.listdir(cwd))
-        file_status.append(f"📁 目录下共 {len(all_files)} 个条目")
+        file_status.append(f"📁 共 {len(all_files)} 个条目")
         for f in all_files[:30]:
             file_status.append(f"   • {f}")
     except Exception as e:
-        file_status.append(f"❌ 无法列出目录: {e}")
+        file_status.append(f"❌ 列目录失败: {e}")
 
-    # 多策略搜索 MD 文件
     md_files = list(set(
         glob.glob('*.md') +
         glob.glob('**/*.md', recursive=True) +
@@ -74,33 +72,30 @@ def load_knowledge_base():
     ))
 
     if not md_files:
-        file_status.append("⚠️ **未找到任何 .md 文件！**")
-        file_status.append("💡 请检查 MD 文件是否在仓库根目录")
+        file_status.append("⚠️ 未找到 .md 文件")
         return None, file_status
 
-    file_status.append(f"🔍 找到 {len(md_files)} 个 MD 文件:")
+    file_status.append(f"🔍 找到 {len(md_files)} 个 MD 文件")
 
     for f in md_files:
         try:
             with open(f, 'r', encoding='utf-8') as fp:
                 content = fp.read()
             full_text += "\n\n" + content
-            size_kb = round(len(content) / 1024, 1)
-            file_status.append(f"✅ {f} | {size_kb} KB")
+            file_status.append(f"✅ {f} | {round(len(content)/1024, 1)} KB")
         except Exception as e:
             file_status.append(f"❌ {f}: {e}")
 
     if not full_text.strip():
-        file_status.append("❌ 所有 MD 文件均为空")
+        file_status.append("❌ MD 文件内容为空")
         return None, file_status
 
     try:
         pf = ProductFilter(full_text)
-        if len(pf.products) == 0:
-            file_status.append("⚠️ 解析完成但未识别到产品")
-            file_status.append("💡 请确认 MD 内含 `**产品编号**: 数字` 格式")
+        if not pf.products:
+            file_status.append("⚠️ 未识别到产品")
             return None, file_status
-        file_status.append(f"🎯 成功解析 {len(pf.products)} 个产品")
+        file_status.append(f"🎯 已解析 {len(pf.products)} 个产品")
         return pf, file_status
     except Exception as e:
         file_status.append(f"❌ 解析失败: {e}")
@@ -108,8 +103,12 @@ def load_knowledge_base():
 
 
 # ==========================================
-# 3. 语音转文字
+# 3. 工具函数
 # ==========================================
+def build_ctrip_url(pid: str) -> str:
+    return f"https://vacations.ctrip.com/travel/detail/p{pid}"
+
+
 def transcribe_audio(audio_bytes):
     if not GEMINI_KEY:
         return None
@@ -117,7 +116,7 @@ def transcribe_audio(audio_bytes):
         model = genai.GenerativeModel("gemini-2.0-flash-exp")
         response = model.generate_content([
             {"mime_type": "audio/wav", "data": audio_bytes},
-            "请严格转写音频内容为文字，不要回答任何问题。中文输出中文。"
+            "请严格转写音频内容为文字，不要回答问题。中文输出中文。"
         ])
         return response.text.strip()
     except Exception as e:
@@ -125,63 +124,71 @@ def transcribe_audio(audio_bytes):
         return None
 
 
-# ==========================================
-# 4. DeepSeek 对话核心
-# ==========================================
-SYSTEM_PROMPT = """你是一名携程国旅高端定制团队的资深产品服务专家。
-你的工作是根据客户咨询，从【精筛产品池】中匹配最合适的产品，并生成可直接发送给客人的专业话术。
+SYSTEM_PROMPT = """
+你是一名携程产品服务推荐专家，负责根据【精筛产品池】回答客户咨询。
 
-【工作准则】：
-1. 严格基于精筛产品池回答，绝不编造产品信息、价格或行程细节。
-2. 如果精筛池中没有完全匹配的产品，要诚实告知客户，并推荐池中最接近的1-2个替代方案。
-3. 产品链接统一使用格式：https://vacations.ctrip.com/travel/detail/p{产品ID}
-4. 单次回复最多推荐 3 个产品，避免选择困难。
-5. 推荐时优先考虑：目的地匹配 > 天数匹配 > 主题/卖点匹配 > 钻级匹配。
-6. 如果精筛池为空或提示"未找到匹配"，要主动询问客户补充信息（目的地、天数、预算、出行日期、人数等）。
+【核心规则】
+1. 只允许基于精筛产品池中的原文回答，严禁编造信息。
+2. 产品ID本体必须是纯数字，如 23593708。
+3. 携程详情链接格式必须是：https://vacations.ctrip.com/travel/detail/p23593708
+4. 对客话术中，只展示数字ID，格式必须是【ID:23593708】。
+5. 如果问题是“费用包含/费用不含/价格包含/酒店/签证/预订限制/行程详情”等，请优先从产品原文中提炼答案。
+6. 如果产品原文未明确写出某项信息，要明确说“当前产品资料中未列明此项”，不要编造。
+7. 如果当前上下文模式是追问模式，说明客户在追问上一轮推荐的产品，请直接围绕这些产品继续回答。
+8. 单次最多推荐 3 个产品，避免过度发散。
+9. 输出对客话术必须简洁、自然、礼貌，可直接发给客人。
+10. 如果客户明确问某个产品ID详情，优先回答该产品，而不是重新推荐其他产品。
 
-【输出格式 - 严格遵守这4个标签段】：
-
+【输出格式 - 严格使用下面4段标签】
 <<<对客话术>>>
-（直接发给客人的话术，要求：礼貌专业、有亲和力、控制在200字以内、自然口语化、可直接复制粘贴到IM。包含核心推荐+1-2个亮点+引导追问。）
+（直接发给客人的话术。若提到产品，必须带【ID:数字ID】）
 <<<END_对客话术>>>
 
 <<<产品链接>>>
-（按推荐优先级列出，每行一个，格式：
-- 【产品标题】 https://vacations.ctrip.com/travel/detail/p产品ID
+（每行一个，格式：
+- 【产品标题】 ID: 23593708 | https://vacations.ctrip.com/travel/detail/p23593708
 ）
 <<<END_产品链接>>>
 
 <<<推荐理由>>>
-（给客服自己看，简明列出：
+（给客服自己看：
 1. 客户需求理解
-2. 为什么推荐这几个产品（匹配点）
-3. 关键卖点/注意事项（行程亮点、酒店、签证、餐食等）
-4. 潜在追问预判）
+2. 命中产品及匹配逻辑
+3. 关键卖点/注意事项
+4. 潜在追问预判
+）
 <<<END_推荐理由>>>
 
 <<<内部诊断>>>
-（中文简要：
-1. 意图识别结果
-2. 精筛池命中情况
-3. 信息完整度评估
-4. 若信息缺失需要补充什么）
+（中文简述：
+1. 当前问题类型：新咨询 / 产品追问 / ID精确查询 / 序号指代
+2. 使用了哪些产品ID
+3. 是否能直接回答
+4. 若不能直接回答，缺什么信息
+）
 <<<END_内部诊断>>>
 """
 
 
-def get_ai_reply(query, history, filtered_context, model_id):
-    """调用 DeepSeek，filtered_context 只包含筛选后的候选产品"""
+def get_ai_reply(query, history, filtered_context, model_id, session_product_ids, recent_product_ids):
     if not ds_client:
         return None, None
 
-    user_content = f"""【精筛产品池】（系统已为本次查询预筛选）：
-{filtered_context}
+    user_content = f"""{filtered_context}
 
 ---
 
-【客户本次咨询】: {query}
+【会话内已推荐过的产品ID】{session_product_ids if session_product_ids else "（暂无）"}
+【上一轮推荐产品ID】{recent_product_ids if recent_product_ids else "（暂无）"}
 
-请按指定格式输出4段内容。"""
+【客户本次咨询】
+{query}
+
+请严格按4段标签输出。
+再次强调：
+- 话术里展示产品时必须写成【ID:23593708】
+- 链接必须写成 https://vacations.ctrip.com/travel/detail/p23593708
+"""
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
@@ -189,7 +196,11 @@ def get_ai_reply(query, history, filtered_context, model_id):
         if msg['role'] == 'user':
             messages.append({"role": "user", "content": msg['content']})
         elif msg['role'] == 'assistant':
-            messages.append({"role": "assistant", "content": msg.get('script', '')})
+            summary = msg.get('script', '')
+            prev_ids = msg.get('hit_ids', [])
+            if prev_ids:
+                summary += f"\n[该轮关联产品ID: {prev_ids}]"
+            messages.append({"role": "assistant", "content": summary})
 
     messages.append({"role": "user", "content": user_content})
 
@@ -197,9 +208,9 @@ def get_ai_reply(query, history, filtered_context, model_id):
         response = ds_client.chat.completions.create(
             model=model_id,
             messages=messages,
-            temperature=0.4,
+            temperature=0.3,
             max_tokens=4000,
-            stream=False,
+            stream=False
         )
 
         usage = response.usage
@@ -221,11 +232,13 @@ def get_ai_reply(query, history, filtered_context, model_id):
 
 
 def parse_reply(raw_text):
-    """解析四段式输出"""
     if not raw_text:
         return {
-            "script": "（AI 无返回）", "links": "", "reason": "",
-            "diagnosis": "", "raw": ""
+            "script": "（AI 无返回）",
+            "links": "",
+            "reason": "",
+            "diagnosis": "",
+            "raw": ""
         }
 
     def extract(tag):
@@ -241,18 +254,51 @@ def parse_reply(raw_text):
     }
 
 
+def validate_output_ids(text, pf):
+    """
+    校验输出中的ID/链接是否对应真实产品
+    允许：
+    - 纯数字ID
+    - p{ID} 链接
+    """
+    numeric_ids = set(re.findall(r'\b(\d{6,9})\b', text))
+    p_url_ids = set(re.findall(r'/detail/[pP](\d{6,9})', text))
+    p_prefixed_ids = set(re.findall(r'[pP](\d{6,9})', text))
+
+    all_ids = numeric_ids | p_url_ids | p_prefixed_ids
+    valid = []
+    invalid = []
+
+    for pid in all_ids:
+        if pid in pf.id_index:
+            valid.append(pid)
+        else:
+            invalid.append(pid)
+
+    return sorted(set(valid)), sorted(set(invalid))
+
+
 # ==========================================
-# 5. UI 渲染辅助
+# 4. 渲染
 # ==========================================
-def render_assistant_msg(msg):
-    """统一渲染 AI 回复"""
+def render_assistant_msg(msg, pf=None):
+    if pf:
+        valid_ids, invalid_ids = validate_output_ids(
+            (msg.get('script', '') or '') + "\n" + (msg.get('links', '') or ''),
+            pf
+        )
+        if invalid_ids:
+            st.error(f"⚠️ 输出中存在知识库未识别的产品ID，请人工核对：{invalid_ids}")
+
     st.markdown("##### 📋 对客话术（一键复制发送给客人）")
     st.code(msg.get('script', ''), language=None)
 
     col1, col2 = st.columns([1, 1])
+
     with col1:
         st.markdown("##### 🔗 推荐产品链接")
         st.markdown(msg.get('links', '') or "_（无）_")
+
     with col2:
         st.markdown("##### 💡 推荐理由")
         st.markdown(msg.get('reason', '') or "_（无）_")
@@ -260,46 +306,49 @@ def render_assistant_msg(msg):
     with st.expander("🔍 内部诊断（仅客服可见）"):
         st.info(msg.get('diagnosis', '') or "_（无）_")
 
+        mode = msg.get('filter_mode', 'unknown')
+        st.caption(f"筛选模式：`{mode}`")
+
+        hit_ids = msg.get('hit_ids', [])
+        if hit_ids:
+            st.caption(f"本轮产品ID：{hit_ids}")
+
         usage = msg.get('usage_info')
         if usage:
-            st.caption("**本轮 Token 使用：**")
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("输入", f"{usage['prompt_tokens']:,}")
             c2.metric("输出", f"{usage['completion_tokens']:,}")
             c3.metric("缓存命中", f"{usage['cache_hit']:,}")
             c4.metric("命中率", f"{usage['hit_rate']:.1f}%")
 
-        hits = msg.get('hit_details')
-        if hits:
-            st.caption("**预筛选命中产品：**")
-            for d in hits:
-                st.caption(
-                    f"`{d['id']}` | {d['score']}分 | {d['days']}天 | "
-                    f"{d['destination']} | {' '.join(d['reasons'])}"
-                )
-
 
 # ==========================================
-# 6. 主程序
+# 5. 主程序
 # ==========================================
 def main():
-    # 加载知识库
     pf, file_status = load_knowledge_base()
 
-    # 初始化状态
     if 'messages' not in st.session_state:
         st.session_state.messages = []
+
+    if 'session_product_ids' not in st.session_state:
+        st.session_state.session_product_ids = []
+
+    if 'recent_product_ids' not in st.session_state:
+        st.session_state.recent_product_ids = []
+
     if 'total_cost_stats' not in st.session_state:
         st.session_state.total_cost_stats = {
-            'calls': 0, 'total_tokens': 0,
-            'cache_hit_total': 0, 'cache_miss_total': 0
+            'calls': 0,
+            'total_tokens': 0,
+            'cache_hit_total': 0,
+            'cache_miss_total': 0
         }
 
-    # ===================== 侧边栏 =====================
+    # ---------- 侧边栏 ----------
     with st.sidebar:
         st.title("⚙️ 控制台")
 
-        # 知识库状态
         with st.expander("📚 知识库状态", expanded=(pf is None)):
             if pf:
                 stats = pf.stats()
@@ -323,38 +372,61 @@ def main():
                 load_knowledge_base.clear()
                 st.rerun()
 
-        # 操作按钮
         st.divider()
+
+        with st.expander(f"🗂️ 上一轮产品池 ({len(st.session_state.recent_product_ids)})", expanded=False):
+            if st.session_state.recent_product_ids and pf:
+                for pid in st.session_state.recent_product_ids:
+                    p = pf.id_index.get(pid)
+                    if p:
+                        st.caption(f"`{pid}` - {p['title'][:40]}")
+            else:
+                st.caption("（暂无）")
+
+        with st.expander(f"🧠 会话记忆产品池 ({len(st.session_state.session_product_ids)})", expanded=False):
+            if st.session_state.session_product_ids and pf:
+                for pid in st.session_state.session_product_ids[-10:]:
+                    p = pf.id_index.get(pid)
+                    if p:
+                        st.caption(f"`{pid}` - {p['title'][:40]}")
+            else:
+                st.caption("（暂无）")
+
+        st.divider()
+
         c1, c2 = st.columns(2)
         if c1.button("🗑️ 清空对话", type="primary", use_container_width=True):
             st.session_state.messages = []
+            st.session_state.session_product_ids = []
+            st.session_state.recent_product_ids = []
             st.rerun()
+
         if c2.button("📊 重置统计", use_container_width=True):
             st.session_state.total_cost_stats = {
-                'calls': 0, 'total_tokens': 0,
-                'cache_hit_total': 0, 'cache_miss_total': 0
+                'calls': 0,
+                'total_tokens': 0,
+                'cache_hit_total': 0,
+                'cache_miss_total': 0
             }
             st.rerun()
 
-        st.caption(f"💬 当前记忆: {len(st.session_state.messages)} 条（≈{len(st.session_state.messages)//2} 轮）")
+        st.caption(f"💬 当前记忆: {len(st.session_state.messages)} 条消息")
 
-        # 模型选择
         st.divider()
+
         model_choice = st.radio(
             "🤖 AI 模型",
             ["DeepSeek V4 Pro", "DeepSeek V4 Flash"],
-            help="Pro：推理强、话术精；Flash：响应快、成本低"
+            help="Pro：推理更强；Flash：响应更快"
         )
         model_id = "deepseek-v4-pro" if "Pro" in model_choice else "deepseek-v4-flash"
         st.caption(f"Model: `{model_id}`")
 
-        # 筛选参数
         st.divider()
         st.markdown("**🎯 筛选参数**")
         top_k = st.slider("候选产品数量", 3, 15, 8)
         max_chars = st.slider("上下文最大字符", 20000, 150000, 80000, step=10000)
 
-        # 成本监控
         st.divider()
         st.markdown("**💰 本次会话成本监控**")
         cs = st.session_state.total_cost_stats
@@ -369,48 +441,38 @@ def main():
         else:
             st.caption("暂无调用记录")
 
-        # API 状态
         st.divider()
-        st.caption("**🔌 API 状态**")
         st.caption(f"DeepSeek: {'🟢 已连接' if ds_client else '🔴 未配置'}")
-        st.caption(f"Gemini 语音: {'🟢 已连接' if GEMINI_KEY else '🔴 未配置'}")
+        st.caption(f"Gemini语音: {'🟢 已连接' if GEMINI_KEY else '🔴 未配置'}")
 
-    # ===================== 主界面 =====================
+    # ---------- 主界面 ----------
     st.title("👩‍💼 携程产品服务专家 Co-Pilot")
 
-    # 兜底：知识库未加载
     if not pf:
-        st.error("❌ **知识库未加载**")
-        st.markdown("""
-        请检查：
-        1. ✅ MD 文件已推送到 GitHub 仓库**根目录**
-        2. ✅ Streamlit Cloud 已 Reboot（Manage app → Reboot app）
-        3. ✅ 文件未被 `.gitignore` 忽略
-
-        👈 **请展开左侧"知识库状态"查看详细诊断信息**，或点击"🔄 重新加载知识库"
-        """)
+        st.error("❌ 知识库未加载成功")
         return
 
     if not ds_client:
-        st.error("❌ DeepSeek API 未配置，请在 `.streamlit/secrets.toml` 设置 `DEEPSEEK_API_KEY`")
+        st.error("❌ DeepSeek API 未配置，请检查 secrets")
         return
 
-    st.caption(f"💡 智能预筛选模式 | 在售产品 {pf.stats()['total']} 个 | 输入客户咨询，AI 自动匹配并生成可发送话术")
+    st.caption(
+        f"💡 智能预筛选 + 追问记忆模式 | 在售产品 {pf.stats()['total']} 个 | "
+        f"支持推荐、产品详情追问、产品ID精确查询"
+    )
 
-    # 语音输入
     with st.expander("🎙️ 语音输入（可选）"):
-        audio_val = st.audio_input("按住录音 - 支持中/英/日混说")
+        audio_val = st.audio_input("按住录音")
 
-    # 历史消息渲染
+    # 历史消息
     for msg in st.session_state.messages:
         if msg['role'] == 'user':
             with st.chat_message("user"):
                 st.write(msg['content'])
         elif msg['role'] == 'assistant':
             with st.chat_message("assistant"):
-                render_assistant_msg(msg)
+                render_assistant_msg(msg, pf)
 
-    # 输入处理
     final_query = None
 
     if audio_val:
@@ -425,49 +487,74 @@ def main():
         final_query = text_input
 
     if final_query:
-        # 去重
-        if not st.session_state.messages or \
-           st.session_state.messages[-1].get('content') != final_query:
-
-            st.session_state.messages.append({"role": "user", "content": final_query})
+        if not st.session_state.messages or st.session_state.messages[-1].get('content') != final_query:
+            st.session_state.messages.append({
+                "role": "user",
+                "content": final_query
+            })
 
             with st.chat_message("user"):
                 st.write(final_query)
 
             with st.chat_message("assistant"):
-                # Step 1: 预筛选
-                with st.spinner("🔍 正在精筛匹配产品..."):
-                    filtered_context, hit_ids, hit_details = pf.build_context(
-                        final_query, top_k=top_k, max_chars=max_chars
+                # Step 1: 预筛选 / 追问复用 / ID直查
+                with st.spinner("🔍 正在匹配产品上下文..."):
+                    filtered_context, hit_ids, hit_details, mode = pf.build_context(
+                        final_query,
+                        top_k=top_k,
+                        max_chars=max_chars,
+                        recent_product_ids=st.session_state.recent_product_ids,
+                        session_product_ids=st.session_state.session_product_ids,
                     )
 
+                mode_tips = {
+                    "new_query": f"🆕 新查询，预筛选命中 {len(hit_details)} 个候选产品",
+                    "direct_id": "🎯 检测到产品ID精确查询",
+                    "ordinal": "🔢 检测到序号指代，已定位到具体产品",
+                    "follow_up_recent": "🔁 检测到追问，已复用上一轮推荐产品",
+                    "follow_up_session": "🧠 检测到追问，已复用会话历史产品池",
+                    "no_match": "⚠️ 暂未命中明确产品，AI 将引导客户补充信息",
+                }
+
+                if mode in ["direct_id", "ordinal", "follow_up_recent", "follow_up_session"]:
+                    st.success(mode_tips.get(mode, mode))
+                elif mode == "no_match":
+                    st.warning(mode_tips.get(mode, mode))
+                else:
+                    st.info(mode_tips.get(mode, mode))
+
                 if hit_details:
-                    with st.expander(f"🎯 预筛选命中 {len(hit_details)} 个候选产品", expanded=False):
+                    with st.expander(f"🎯 本轮产品上下文 ({len(hit_details)})", expanded=False):
                         for d in hit_details:
                             st.caption(
                                 f"`{d['id']}` | {d['score']}分 | {d['days']}天 | "
                                 f"{d['destination']} | {' '.join(d['reasons'])}"
                             )
-                            st.caption(f"  └─ {d['title'][:60]}")
-                else:
-                    st.warning("⚠️ 预筛选未命中明确匹配，AI 将引导客户补充信息")
+                            st.caption(f"  └─ {d['title'][:80]}")
 
-                # Step 2: 调用 DeepSeek
-                with st.spinner(f"🤖 {model_choice} 正在生成话术..."):
+                # Step 2: 调用模型
+                with st.spinner(f"🤖 {model_choice} 正在生成答复..."):
                     raw, usage_info = get_ai_reply(
                         final_query,
                         st.session_state.messages[:-1],
                         filtered_context,
-                        model_id
+                        model_id,
+                        st.session_state.session_product_ids,
+                        st.session_state.recent_product_ids,
                     )
-
-                if raw is None:
-                    st.error("AI 调用失败")
-                    return
 
                 parsed = parse_reply(raw)
 
-                # 更新成本统计
+                # 更新产品池
+                st.session_state.recent_product_ids = hit_ids[:]
+
+                for pid in hit_ids:
+                    if pid not in st.session_state.session_product_ids:
+                        st.session_state.session_product_ids.append(pid)
+
+                st.session_state.session_product_ids = st.session_state.session_product_ids[-20:]
+
+                # 更新统计
                 if usage_info:
                     cs = st.session_state.total_cost_stats
                     cs['calls'] += 1
@@ -475,15 +562,17 @@ def main():
                     cs['cache_hit_total'] += usage_info['cache_hit']
                     cs['cache_miss_total'] += usage_info['cache_miss']
 
-                # 存入历史 + 渲染
                 msg_data = {
                     "role": "assistant",
                     **parsed,
+                    "hit_ids": hit_ids,
                     "hit_details": hit_details,
                     "usage_info": usage_info,
+                    "filter_mode": mode,
                 }
+
                 st.session_state.messages.append(msg_data)
-                render_assistant_msg(msg_data)
+                render_assistant_msg(msg_data, pf)
 
 
 if __name__ == "__main__":
