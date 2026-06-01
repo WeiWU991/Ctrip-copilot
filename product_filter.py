@@ -1,7 +1,11 @@
 """
-携程产品智能预筛选器 V3
-- 支持新查询 / 产品ID精确查询 / 追问复用 / 序号指代
-- 兼容携程URL格式：/detail/p{产品ID}
+携程产品智能预筛选器 V3.1
+- 支持：
+  1) 普通新查询
+  2) 产品ID精确查询（支持 23593708 / p23593708 / 完整链接）
+  3) 追问复用上一轮产品池
+  4) 序号指代（第一个/第二个）
+- 携程URL格式：/detail/p{产品ID}
 """
 
 import re
@@ -137,7 +141,7 @@ class ProductFilter:
                 'level': level,
                 'tags': tags,
                 'full_text': chunk.strip(),
-                'searchable': f"{title} {destination} {tags} {chunk[:3000]}".lower(),
+                'searchable': f"{title} {destination} {tags} {chunk[:4000]}".lower(),
             })
 
         return products
@@ -161,20 +165,17 @@ class ProductFilter:
         return [t for t in self.THEME_KEYWORDS if t in query]
 
     def _extract_raw_ids(self, query: str) -> List[str]:
-        """
-        兼容三种输入：
-        - 23593708
-        - p23593708 / P23593708
-        - https://vacations.ctrip.com/travel/detail/p23593708
-        """
         ids = set()
 
+        # 纯数字
         for x in re.findall(r'\b(\d{6,9})\b', query):
             ids.add(x)
 
+        # p12345678 / P12345678
         for x in re.findall(r'[pP](\d{6,9})', query):
             ids.add(x)
 
+        # 链接里的 /detail/p12345678
         for x in re.findall(r'/detail/[pP](\d{6,9})', query):
             ids.add(x)
 
@@ -191,7 +192,6 @@ class ProductFilter:
 
         has_dest = bool(self._extract_destinations(query))
         has_detail = any(kw in query for kw in self.DETAIL_KEYWORDS)
-
         if not has_dest and has_detail and len(query) <= 40:
             return True, "细节追问"
 
@@ -277,28 +277,23 @@ class ProductFilter:
         mode = 'new_query'
         target_products = []
 
-        # 1) 直接产品ID查询
         if direct_ids:
             target_products = self.get_by_ids(direct_ids)
             mode = 'direct_id'
 
-        # 2) 序号指代，优先指向上一轮产品
         elif ordinal is not None and recent_product_ids:
             if ordinal < len(recent_product_ids):
                 target_products = self.get_by_ids([recent_product_ids[ordinal]])
                 mode = 'ordinal'
 
-        # 3) 追问场景：优先复用上一轮命中的产品
         elif is_followup and recent_product_ids:
             target_products = self.get_by_ids(recent_product_ids[:5])
             mode = 'follow_up_recent'
 
-        # 4) 如果上一轮没有，但会话里有历史产品池，则退而求其次
         elif is_followup and session_product_ids:
             target_products = self.get_by_ids(session_product_ids[-5:])
             mode = 'follow_up_session'
 
-        # 5) 普通新查询
         if not target_products:
             results = self.filter(query, top_k)
             if not results:
@@ -309,6 +304,7 @@ class ProductFilter:
                     f"请引导客户补充：目的地、天数、预算、出行日期、人数。"
                 )
                 return context, [], [], 'no_match'
+
             return self._format_context(query, results, max_chars, 'new_query')
 
         results = [(1000, p, [mode, f"触发:{trigger}" if trigger else mode]) for p in target_products]
@@ -321,9 +317,9 @@ class ProductFilter:
             f"【上下文模式】{mode}\n"
             f"【客户原始问题】{query}\n"
             f"【允许引用的产品ID白名单】{id_list}\n"
-            f"【链接格式】https://vacations.ctrip.com/travel/detail/p{{产品ID}}\n"
+            f"【携程链接格式】https://vacations.ctrip.com/travel/detail/p{{产品ID}}\n"
             f"【对客展示ID格式】【ID:产品ID】\n"
-            f"【严禁】引用白名单外的产品ID、酒店、价格或费用信息\n\n"
+            f"【严禁】引用白名单外的信息\n\n"
         )
 
         chunks = [header]
