@@ -1,9 +1,8 @@
 """
-携程产品服务专家 Co-Pilot V3
-- DeepSeek V4 Pro / Flash
-- 智能预筛选
-- 支持追问、序号指代、产品ID精确查询
-- 携程链接格式：/detail/p{产品ID}
+携程产品服务专家 Co-Pilot V3.1
+- 修复 build_context 参数不一致问题
+- 支持携程 p{产品ID} 链接
+- 支持追问 / 序号指代 / 产品ID精确查询
 """
 
 import streamlit as st
@@ -255,12 +254,6 @@ def parse_reply(raw_text):
 
 
 def validate_output_ids(text, pf):
-    """
-    校验输出中的ID/链接是否对应真实产品
-    允许：
-    - 纯数字ID
-    - p{ID} 链接
-    """
     numeric_ids = set(re.findall(r'\b(\d{6,9})\b', text))
     p_url_ids = set(re.findall(r'/detail/[pP](\d{6,9})', text))
     p_prefixed_ids = set(re.findall(r'[pP](\d{6,9})', text))
@@ -345,7 +338,6 @@ def main():
             'cache_miss_total': 0
         }
 
-    # ---------- 侧边栏 ----------
     with st.sidebar:
         st.title("⚙️ 控制台")
 
@@ -416,8 +408,7 @@ def main():
 
         model_choice = st.radio(
             "🤖 AI 模型",
-            ["DeepSeek V4 Pro", "DeepSeek V4 Flash"],
-            help="Pro：推理更强；Flash：响应更快"
+            ["DeepSeek V4 Pro", "DeepSeek V4 Flash"]
         )
         model_id = "deepseek-v4-pro" if "Pro" in model_choice else "deepseek-v4-flash"
         st.caption(f"Model: `{model_id}`")
@@ -445,7 +436,6 @@ def main():
         st.caption(f"DeepSeek: {'🟢 已连接' if ds_client else '🔴 未配置'}")
         st.caption(f"Gemini语音: {'🟢 已连接' if GEMINI_KEY else '🔴 未配置'}")
 
-    # ---------- 主界面 ----------
     st.title("👩‍💼 携程产品服务专家 Co-Pilot")
 
     if not pf:
@@ -458,13 +448,12 @@ def main():
 
     st.caption(
         f"💡 智能预筛选 + 追问记忆模式 | 在售产品 {pf.stats()['total']} 个 | "
-        f"支持推荐、产品详情追问、产品ID精确查询"
+        f"支持推荐、详情追问、产品ID精确查询"
     )
 
     with st.expander("🎙️ 语音输入（可选）"):
         audio_val = st.audio_input("按住录音")
 
-    # 历史消息
     for msg in st.session_state.messages:
         if msg['role'] == 'user':
             with st.chat_message("user"):
@@ -497,10 +486,9 @@ def main():
                 st.write(final_query)
 
             with st.chat_message("assistant"):
-                # Step 1: 预筛选 / 追问复用 / ID直查
                 with st.spinner("🔍 正在匹配产品上下文..."):
                     filtered_context, hit_ids, hit_details, mode = pf.build_context(
-                        final_query,
+                        query=final_query,
                         top_k=top_k,
                         max_chars=max_chars,
                         recent_product_ids=st.session_state.recent_product_ids,
@@ -532,7 +520,6 @@ def main():
                             )
                             st.caption(f"  └─ {d['title'][:80]}")
 
-                # Step 2: 调用模型
                 with st.spinner(f"🤖 {model_choice} 正在生成答复..."):
                     raw, usage_info = get_ai_reply(
                         final_query,
@@ -545,7 +532,6 @@ def main():
 
                 parsed = parse_reply(raw)
 
-                # 更新产品池
                 st.session_state.recent_product_ids = hit_ids[:]
 
                 for pid in hit_ids:
@@ -554,7 +540,6 @@ def main():
 
                 st.session_state.session_product_ids = st.session_state.session_product_ids[-20:]
 
-                # 更新统计
                 if usage_info:
                     cs = st.session_state.total_cost_stats
                     cs['calls'] += 1
