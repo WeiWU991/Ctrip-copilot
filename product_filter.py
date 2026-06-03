@@ -1,11 +1,8 @@
 """
-携程产品智能预筛选器 V3.1
-- 支持：
-  1) 普通新查询
-  2) 产品ID精确查询（支持 23593708 / p23593708 / 完整链接）
-  3) 追问复用上一轮产品池
-  4) 序号指代（第一个/第二个）
-- 携程URL格式：/detail/p{产品ID}
+携程产品智能预筛选器 V3.2
+- 支持新查询 / 产品ID精确查询 / 追问复用 / 序号指代
+- 兼容携程URL格式：/detail/p{产品ID}
+- 自动跳过签证条目（防止误解析）
 """
 
 import re
@@ -89,11 +86,11 @@ class ProductFilter:
         '行程', '安排', '日程', '游玩',
         '餐', '餐食', '早餐', '午餐', '晚餐',
         '交通', '航班', '机票', '火车', '巴士', '接送',
-        '签证', '保险',
+        '保险',
         '退改', '取消', '退款',
         '区别', '差别', '对比', '比较', '哪个好',
         '详情', '细节', '具体',
-        '预订限制', '须知', '预定', '预订',
+        '预订限制', '预订须知', '预定', '预订',
     ]
 
     def __init__(self, md_text: str):
@@ -107,6 +104,9 @@ class ProductFilter:
 
         for chunk in chunks:
             if "**产品编号**" not in chunk:
+                continue
+            # 跳过签证条目（防止被当作产品解析）
+            if "**签证编号**" in chunk:
                 continue
 
             pid_m = re.search(r'\*\*产品编号\*\*:\s*(\d+)', chunk)
@@ -166,19 +166,12 @@ class ProductFilter:
 
     def _extract_raw_ids(self, query: str) -> List[str]:
         ids = set()
-
-        # 纯数字
         for x in re.findall(r'\b(\d{6,9})\b', query):
             ids.add(x)
-
-        # p12345678 / P12345678
         for x in re.findall(r'[pP](\d{6,9})', query):
             ids.add(x)
-
-        # 链接里的 /detail/p12345678
         for x in re.findall(r'/detail/[pP](\d{6,9})', query):
             ids.add(x)
-
         return list(ids)
 
     def _extract_product_ids(self, query: str) -> List[str]:
@@ -304,7 +297,6 @@ class ProductFilter:
                     f"请引导客户补充：目的地、天数、预算、出行日期、人数。"
                 )
                 return context, [], [], 'no_match'
-
             return self._format_context(query, results, max_chars, 'new_query')
 
         results = [(1000, p, [mode, f"触发:{trigger}" if trigger else mode]) for p in target_products]
